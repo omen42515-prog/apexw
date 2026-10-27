@@ -323,10 +323,11 @@ apexw/
 │   └── csrc/                # C++/CUDA source files (packaged in wheels)
 │       ├── apexw_cuda.cpp
 │       └── apexw_cuda_kernel.cu
-├── tests/                   # Comprehensive unit test suite (87 passing, 1 skipped)
+├── tests/                   # Comprehensive unit test suite (90 passing, 1 skipped)
 │   ├── __init__.py
 │   └── test_apexw.py
 ├── benchmarks/              # Performance, throughput, and scaling benchmarks
+│   ├── benchmark_small_mlp_flattening.py  # 100-layer small MLP parameter flattening benchmark
 │   ├── benchmark_flattened_many_small.py  # 2,000 parameter flattening benchmark
 │   ├── benchmark.py
 │   ├── benchmark_vision_cnn.py    # CNN activation bottleneck & checkpointing benchmark
@@ -359,7 +360,7 @@ Run the full test suite:
 pytest tests/
 ```
 
-Expected output: **87 passed, 1 skipped** (the skipped test requires an active CUDA device for `torch.cuda.CUDAGraph` capture).
+Expected output: **90 passed, 1 skipped** (the skipped test requires an active CUDA device for `torch.cuda.CUDAGraph` capture).
 
 You can also run tests the old-fashioned way with `unittest`:
 
