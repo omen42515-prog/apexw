@@ -2123,6 +2123,81 @@ class TestRegressionBugs(unittest.TestCase):
             self.assertTrue(torch.equal(p.grad, initial_grads[p]), "Gradients were mutated during profiling")
 
 
+class TestParameterFlattening(unittest.TestCase):
+    """Unit and integration tests for parameter flattening / grouping in Many-Small scenarios."""
+
+    def test_flatten_parameters_output_and_gradient_parity(self):
+        """Verify forward output, backward gradients, and parameter count reduction."""
+        from apexw import flatten_parameters, is_flattened
+
+        torch.manual_seed(42)
+        model = nn.Sequential(
+            nn.Linear(8, 16),
+            nn.ReLU(),
+            nn.Linear(16, 8),
+            nn.LayerNorm(8),
+        )
+        x = torch.randn(4, 8)
+        y_ref = model(x)
+
+        # Flatten model
+        flat_p = flatten_parameters(model)
+        self.assertTrue(is_flattened(model))
+        self.assertEqual(len(list(model.parameters())), 1)
+        self.assertIs(list(model.parameters())[0], flat_p)
+
+        # Forward output should match exactly
+        y_flat = model(x)
+        self.assertTrue(torch.allclose(y_ref, y_flat, atol=1e-6))
+
+        # Backward accumulation into flat parameter
+        loss = y_flat.sum()
+        loss.backward()
+        self.assertIsNotNone(flat_p.grad)
+        self.assertEqual(flat_p.grad.shape, flat_p.shape)
+        self.assertGreater(flat_p.grad.norm().item(), 0.0)
+
+    def test_flatten_parameters_zero_copy_live_update(self):
+        """Verify optimizer step on flat_param mutates sub-module views in-place with zero copy."""
+        from apexw import ApexW, flatten_parameters
+
+        torch.manual_seed(42)
+        model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+        flat_p = flatten_parameters(model)
+        opt = ApexW([flat_p], lr=0.1)
+
+        w0_before = model[0].weight.clone()
+        x = torch.randn(2, 4)
+        model(x).sum().backward()
+        opt.step()
+
+        w0_after = model[0].weight.clone()
+        self.assertFalse(torch.equal(w0_before, w0_after))
+        # Ensure sub-module view points to the exact same memory as flat_param
+        self.assertTrue(torch.allclose(w0_after, flat_p[:16].view(4, 4)))
+
+    def test_flatten_parameters_checkpoint_roundtrip(self):
+        """Verify get_unflattened_state_dict and load_unflattened_state_dict preserve checkpoints."""
+        from apexw import flatten_parameters
+
+        torch.manual_seed(42)
+        m_orig = nn.Sequential(nn.Linear(4, 4), nn.LayerNorm(4))
+        sd_orig = {k: v.clone() for k, v in m_orig.state_dict().items()}
+
+        m_flat = nn.Sequential(nn.Linear(4, 4), nn.LayerNorm(4))
+        flatten_parameters(m_flat)
+        m_flat.load_unflattened_state_dict(sd_orig)
+
+        # Verify equivalence
+        x = torch.randn(3, 4)
+        self.assertTrue(torch.allclose(m_orig(x), m_flat(x), atol=1e-6))
+
+        sd_exported = m_flat.get_unflattened_state_dict()
+        self.assertEqual(set(sd_orig.keys()), set(sd_exported.keys()))
+        for k in sd_orig:
+            self.assertTrue(torch.equal(sd_orig[k], sd_exported[k]))
+
+
 if __name__ == "__main__":
     unittest.main()
 
