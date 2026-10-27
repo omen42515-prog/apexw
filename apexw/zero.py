@@ -98,11 +98,13 @@ class ApexWZeRO(Optimizer):
         # Build sharded local parameter slices for this rank
         self._sharded_param_map = []
         self._local_params = []
+        self._local_param_groups = []
         self._init_zero_sharding()
 
-        # Local ApexW engine that manages ONLY this rank's partition
+        # Local ApexW engine that manages ONLY this rank's partition,
+        # preserving all per-group hyperparameters (lr, weight_decay, betas, eps, precision, etc.)
         self._local_opt = ApexW(
-            self._local_params,
+            self._local_param_groups,
             lr=lr,
             betas=betas,
             eps=eps,
@@ -122,12 +124,18 @@ class ApexWZeRO(Optimizer):
 
     def _init_zero_sharding(self):
         """
-        Partitions parameters across ranks.
+        Partitions parameters across ranks while preserving per-group configuration.
         2D+ tensors are sliced along dimension 0.
         1D normalization / bias tensors are assigned round-robin.
         """
         p_index = 0
+        self._local_params = []
+        self._local_param_groups = []
+
         for group in self.param_groups:
+            local_group = {k: v for k, v in group.items() if k != "params"}
+            local_group["params"] = []
+
             for p in group["params"]:
                 numel = p.numel()
                 # Slicing along dim 0 for large tensors
@@ -141,6 +149,7 @@ class ApexWZeRO(Optimizer):
                     else:
                         local_slice = torch.empty((0, *p.shape[1:]), dtype=p.dtype, device=p.device).requires_grad_(True)
 
+                    local_group["params"].append(local_slice)
                     self._local_params.append(local_slice)
                     self._sharded_param_map.append({
                         "type": "slice",
@@ -156,6 +165,7 @@ class ApexWZeRO(Optimizer):
                     owner_rank = p_index % self.world_size
                     if owner_rank == self.rank:
                         local_p = p.data.clone().detach().requires_grad_(True)
+                        local_group["params"].append(local_p)
                         self._local_params.append(local_p)
                         self._sharded_param_map.append({
                             "type": "round_robin",
@@ -171,6 +181,8 @@ class ApexWZeRO(Optimizer):
                             "owner_rank": owner_rank,
                         })
                 p_index += 1
+
+            self._local_param_groups.append(local_group)
 
     def zero_grad(self, set_to_none: bool = True):
         super().zero_grad(set_to_none=set_to_none)
@@ -190,7 +202,13 @@ class ApexWZeRO(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        # 1. Sync full gradients into local shards
+        # 1. Sync per-group hyperparameters (e.g. from learning rate schedulers)
+        for outer_g, inner_g in zip(self.param_groups, self._local_opt.param_groups):
+            for k, v in outer_g.items():
+                if k != "params":
+                    inner_g[k] = v
+
+        # 2. Sync full gradients into local shards
         for item in self._sharded_param_map:
             full_p = item["full_param"]
             loc = item["local_slice"]
@@ -204,7 +222,7 @@ class ApexWZeRO(Optimizer):
             else:
                 loc.grad = full_p.grad.data
 
-        # 2. Update local shards using ApexW engine (16-bit compact states, dynamic scaling, etc.)
+        # 3. Update local shards using ApexW engine (16-bit compact states, dynamic scaling, etc.)
         self._local_opt.step()
 
         # 3. Synchronize updated local parameter shards across distributed ranks
@@ -272,9 +290,71 @@ class ApexWZeRO(Optimizer):
             },
         }
 
+    def add_param_group(self, param_group: dict):
+        """Adds a new parameter group, creating sharded local slices for this rank."""
+        super().add_param_group(param_group)
+        if not hasattr(self, "_local_opt"):
+            return
+        added_group = self.param_groups[-1]
+        local_group = {k: v for k, v in added_group.items() if k != "params"}
+        local_group["params"] = []
+
+        p_index = len(self._sharded_param_map)
+        for p in added_group["params"]:
+            numel = p.numel()
+            if p.dim() >= 1 and numel >= self.world_size * 256:
+                dim0 = p.shape[0]
+                chunk_size = (dim0 + self.world_size - 1) // self.world_size
+                start = min(self.rank * chunk_size, dim0)
+                end = min((self.rank + 1) * chunk_size, dim0)
+                if end > start:
+                    local_slice = p.data[start:end].clone().detach().requires_grad_(True)
+                else:
+                    local_slice = torch.empty((0, *p.shape[1:]), dtype=p.dtype, device=p.device).requires_grad_(True)
+                local_group["params"].append(local_slice)
+                self._local_params.append(local_slice)
+                self._sharded_param_map.append({
+                    "type": "slice",
+                    "full_param": p,
+                    "local_slice": local_slice,
+                    "start": start,
+                    "end": end,
+                    "dim0": dim0,
+                    "chunk_size": chunk_size,
+                })
+            else:
+                owner_rank = p_index % self.world_size
+                if owner_rank == self.rank:
+                    local_p = p.data.clone().detach().requires_grad_(True)
+                    local_group["params"].append(local_p)
+                    self._local_params.append(local_p)
+                    self._sharded_param_map.append({
+                        "type": "round_robin",
+                        "full_param": p,
+                        "local_slice": local_p,
+                        "owner_rank": owner_rank,
+                    })
+                else:
+                    self._sharded_param_map.append({
+                        "type": "round_robin",
+                        "full_param": p,
+                        "local_slice": None,
+                        "owner_rank": owner_rank,
+                    })
+            p_index += 1
+
+        self._local_param_groups.append(local_group)
+        self._local_opt.add_param_group(local_group)
+
     def load_state_dict(self, state_dict):
         """Restores inner optimizer state from a checkpoint produced by state_dict()."""
         self._local_opt.load_state_dict(state_dict["local_opt"])
+
+        # Reflect restored hyperparameters back to outer param groups
+        for outer_g, inner_g in zip(self.param_groups, self._local_opt.param_groups):
+            for k, v in inner_g.items():
+                if k != "params":
+                    outer_g[k] = v
 
         meta = state_dict.get("zero_meta", {})
         saved_rank = meta.get("rank")
