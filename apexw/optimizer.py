@@ -66,6 +66,8 @@ except ImportError:
         def is_compiling():
             return False
 
+CAPTURABLE_SUPPORTED_DEVICES = ("cuda", "xpu", "hpu", "privateuseone")
+
 
 def _mps_supports_bfloat16() -> bool:
     """Checks whether Apple Silicon MPS backend supports bfloat16 on this host."""
@@ -580,6 +582,33 @@ class ApexW(Optimizer):
             if not params_with_grad:
                 continue
 
+            # Retrieve AMP grad_scale and found_inf if set by GradScaler
+            grad_scale = getattr(self, "grad_scale", None)
+            found_inf = getattr(self, "found_inf", None)
+
+            compiling = is_compiling()
+            is_capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+            # Early AMP skip if inf/NaN detected by GradScaler in eager execution.
+            # Even when capturable=True, if not currently inside an active CUDA graph capture,
+            # we must immediately skip to prevent corrupting weights or momentum buffers.
+            if found_inf is not None and not is_capturing and not compiling:
+                if found_inf.item() > 0:
+                    continue
+
+            # In-optimizer gradient unscaling before clipping and centralization.
+            # PyTorch GradScaler leaves gradients scaled when _step_supports_amp_scaling=True.
+            # If clip_grad_norm or grad_centralization is requested, gradients must be unscaled
+            # FIRST so clipping calculates the true Euclidean norm instead of the scaled norm.
+            clip_norm = group["clip_grad_norm"]
+            backend_grad_scale = grad_scale
+            if grad_scale is not None and (clip_norm is not None or group.get("grad_centralization", False)):
+                first_dev = grads[0].device
+                scale_t = grad_scale.to(first_dev) if grad_scale.device != first_dev else grad_scale
+                inv_scale_t = scale_t.reciprocal()
+                torch._foreach_mul_(grads, inv_scale_t)
+                backend_grad_scale = None  # Gradients are already unscaled; do not unscale again
+
             # In-optimizer gradient centralization (ECCV 2020)
             if group.get("grad_centralization", False):
                 for g in grads:
@@ -587,8 +616,7 @@ class ApexW(Optimizer):
                         dims = tuple(range(1, g.dim()))
                         g.sub_(g.mean(dim=dims, keepdim=True))
 
-            # In-optimizer fused gradient norm clipping (zero-allocation, zero-sync)
-            clip_norm = group["clip_grad_norm"]
+            # In-optimizer fused gradient norm clipping on true (unscaled) gradients
             if clip_norm is not None:
                 norms = torch._foreach_norm(grads, 2.0)
                 first_dev = grads[0].device
@@ -616,18 +644,12 @@ class ApexW(Optimizer):
             precision = group["precision"]
             fused = group.get("fused", False)
 
-            # Retrieve AMP grad_scale and found_inf if set by GradScaler
-            grad_scale = getattr(self, "grad_scale", None)
-            found_inf = getattr(self, "found_inf", None)
-
             backend = group.get("backend", None)
             is_xla = (params_with_grad[0].device.type == "xla")
             is_mps = (params_with_grad[0].device.type == "mps")
             is_cuda = params_with_grad[0].is_cuda
             is_accelerator = params_with_grad[0].device.type != "cpu"
             use_foreach = (foreach is True) or (foreach is None and is_accelerator)
-
-            compiling = is_compiling()
 
             # -------------------------------------------------------------
             # PATH 1: Google TPU Global Graph Compilation (PyTorch XLA)
@@ -659,14 +681,9 @@ class ApexW(Optimizer):
                 )
                 continue
 
-            # Early AMP skip if inf/NaN detected by GradScaler
-            if found_inf is not None and not capturable and not compiling:
-                if found_inf.item() > 0:
-                    continue
-
             inv_scale = 1.0
-            if grad_scale is not None and not capturable and not compiling:
-                inv_scale = float(grad_scale.reciprocal().item())
+            if backend_grad_scale is not None and not is_capturing and not compiling:
+                inv_scale = float(backend_grad_scale.reciprocal().item())
 
             # -------------------------------------------------------------
             # PATH 2: OpenAI Triton Fused GPU Kernel (NVIDIA CUDA & AMD ROCm)
@@ -737,7 +754,7 @@ class ApexW(Optimizer):
                 and not capturable
                 and not compiling
                 and not maximize
-                and grad_scale is None
+                and backend_grad_scale is None
                 and found_inf is None
                 and steps_are_uniform
                 and is_cuda_kernel_available()
@@ -794,7 +811,7 @@ class ApexW(Optimizer):
                     weight_decay=wd,
                     amsgrad=amsgrad,
                     maximize=maximize,
-                    grad_scale=grad_scale,
+                    grad_scale=backend_grad_scale,
                     found_inf=found_inf,
                 )
             elif use_foreach or is_mps or backend in ("mps", "foreach", "_multi_tensor"):
@@ -824,7 +841,7 @@ class ApexW(Optimizer):
                         precision=precision,
                         dynamic_scaling=group.get("dynamic_scaling", True),
                         has_complex=has_complex,
-                        grad_scale=grad_scale,
+                        grad_scale=backend_grad_scale,
                         found_inf=found_inf,
                     )
                 except (NotImplementedError, RuntimeError):
@@ -855,7 +872,7 @@ class ApexW(Optimizer):
                             precision=precision,
                             dynamic_scaling=group.get("dynamic_scaling", True),
                             has_complex=has_complex,
-                            grad_scale=grad_scale,
+                            grad_scale=backend_grad_scale,
                             found_inf=found_inf,
                         )
                     else:
@@ -886,7 +903,7 @@ class ApexW(Optimizer):
                     precision=precision,
                     dynamic_scaling=group.get("dynamic_scaling", True),
                     has_complex=has_complex,
-                    grad_scale=grad_scale,
+                    grad_scale=backend_grad_scale,
                     found_inf=found_inf,
                 )
 
@@ -931,24 +948,28 @@ class ApexW(Optimizer):
         # Step 1: Update step counters in-place on device (zero host barrier)
         for st in state_steps:
             st.add_(1)
-        step_t = state_steps[0]
 
-        # Step 2: Compute bias correction scalars purely as on-device tensors
+        # Step 2: Compute shared device tensors for bias corrections (per-step, inside param loop)
         beta1_t = torch.tensor(beta1, dtype=torch.float32, device=device)
         beta2_t = torch.tensor(beta2, dtype=torch.float32, device=device)
-        bc1 = 1.0 - torch.pow(beta1_t, step_t)
-        bc2 = 1.0 - torch.pow(beta2_t, step_t)
-        bc2_sqrt = torch.sqrt(bc2)
-        step_size = lr * bc2_sqrt / bc1
-        eps_scaled = eps * bc2_sqrt
-
-        slow_ratio = None
-        if beta3 is not None:
-            beta3_t = torch.tensor(beta3, dtype=torch.float32, device=device)
-            slow_ratio = alpha * (bc1 / (1.0 - torch.pow(beta3_t, step_t)))
+        beta3_t = torch.tensor(beta3, dtype=torch.float32, device=device) if beta3 is not None else None
 
         # Step 3: Fused tensor updates
         for i, p in enumerate(params):
+            # Bug 6 fix: use per-parameter step_t, not always state_steps[0]
+            step_t = state_steps[i]
+
+            # Compute bias correction scalars for this parameter's step
+            bc1 = 1.0 - torch.pow(beta1_t, step_t)
+            bc2 = 1.0 - torch.pow(beta2_t, step_t)
+            bc2_sqrt = torch.sqrt(bc2)
+            step_size = lr * bc2_sqrt / bc1
+            eps_scaled = eps * bc2_sqrt
+
+            slow_ratio = None
+            if beta3 is not None:
+                slow_ratio = alpha * (bc1 / (1.0 - torch.pow(beta3_t, step_t)))
+
             g = grads[i]
             m = exp_avgs[i]
             m_slow = exp_avgs_slow[i] if beta3 is not None else None
@@ -1004,6 +1025,9 @@ class ApexW(Optimizer):
 
             if cautious:
                 mask = (g.float() * num.float() >= 0).to(p.dtype)
+                # Bug 7 fix: normalize mask to preserve update magnitude, matching _single_tensor_step
+                mask_mean = mask.mean().clamp(min=1e-3)
+                mask.div_(mask_mean)
                 num = num * mask
 
             p.addcdiv_(num, denom, value=-step_size)
@@ -1089,7 +1113,8 @@ class ApexW(Optimizer):
         """Eager single-tensor update with folded scalar math."""
         compiling = is_compiling()
 
-        if found_inf is not None and not capturable and not compiling:
+        is_capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        if found_inf is not None and not is_capturing and not compiling:
             if found_inf.item() > 0:
                 return
 
@@ -1098,14 +1123,13 @@ class ApexW(Optimizer):
             inv_scale = grad_scale.reciprocal()
 
         if capturable:
-            capturable_supported_devices = ["cuda", "xpu", "hpu", "privateuseone"]
             for p, step_t in zip(params, state_steps):
                 if p.device.type != step_t.device.type:
                     raise RuntimeError(
                         f"capturable requires param and step to be on the same device, "
                         f"but param is on {p.device} and step is on {step_t.device}"
                     )
-                if p.device.type not in capturable_supported_devices:
+                if p.device.type not in CAPTURABLE_SUPPORTED_DEVICES:
                     raise RuntimeError(
                         f"capturable is not supported on {p.device.type}"
                     )
@@ -1257,7 +1281,10 @@ class ApexW(Optimizer):
             # Fast path for standard AdamW (zero extra allocations)
             if not amsgrad and not cautious and not nesterov and m_slow is None:
                 if capturable or compiling:
-                    denom = (v.sqrt() / (bc2_sqrt * step_size_neg)).add_(effective_eps / step_size_neg)
+                    if scale_v != 1.0:
+                        denom = (v.sqrt() / sqrt_scale_v / (bc2_sqrt * step_size_neg)).add_(effective_eps / step_size_neg)
+                    else:
+                        denom = (v.sqrt() / (bc2_sqrt * step_size_neg)).add_(effective_eps / step_size_neg)
                     p.addcdiv_(m, denom)
                 else:
                     if scale_v != 1.0:
@@ -1272,7 +1299,10 @@ class ApexW(Optimizer):
                 v_target = max_exp_avg_sqs[i] if amsgrad else v
                 if amsgrad:
                     torch.maximum(v_target, v, out=v_target)
-                denom = (v_target.sqrt() / (bc2_sqrt * step_size_neg)).add_(effective_eps / step_size_neg)
+                if scale_v != 1.0:
+                    denom = (v_target.sqrt() / sqrt_scale_v / (bc2_sqrt * step_size_neg)).add_(effective_eps / step_size_neg)
+                else:
+                    denom = (v_target.sqrt() / (bc2_sqrt * step_size_neg)).add_(effective_eps / step_size_neg)
             else:
                 if amsgrad:
                     max_v = max_exp_avg_sqs[i]
@@ -1345,14 +1375,13 @@ class ApexW(Optimizer):
         compiling = is_compiling()
 
         if capturable and not compiling:
-            capturable_supported_devices = ["cuda", "xpu", "hpu", "privateuseone"]
             for p, step_t in zip(params, state_steps):
                 if p.device.type != step_t.device.type:
                     raise RuntimeError(
                         f"capturable requires param and step to be on the same device, "
                         f"but param is on {p.device} and step is on {step_t.device}"
                     )
-                if p.device.type not in capturable_supported_devices:
+                if p.device.type not in CAPTURABLE_SUPPORTED_DEVICES:
                     raise RuntimeError(
                         f"capturable is not supported on {p.device.type}"
                     )
@@ -1458,7 +1487,8 @@ class ApexW(Optimizer):
                 device_found_inf = found_inf
                 if dev is not None and found_inf.device != dev:
                     device_found_inf = found_inf.to(dev)
-                if not capturable and not compiling and device_found_inf.item() > 0:
+                is_capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+                if not is_capturing and not compiling and device_found_inf.item() > 0:
                     continue
 
             # Handle AMP grad_scale: in-place unscaling (zero auxiliary VRAM allocations)
@@ -1477,8 +1507,10 @@ class ApexW(Optimizer):
             else:
                 torch._foreach_add_(d_steps, 1)
 
+            use_tensor_steps = capturable or compiling
+
             # Compute bias correction scalars
-            if capturable or compiling:
+            if use_tensor_steps:
                 step_lr = max(lr, 1e-16) if isinstance(lr, (int, float)) else lr
                 bias_correction1 = torch._foreach_pow(beta1, d_steps)
                 bias_correction2 = torch._foreach_pow(beta2, d_steps)
@@ -1491,7 +1523,14 @@ class ApexW(Optimizer):
 
                 step_size_list = bias_correction1
                 bc2_sqrt_list = bias_correction2
-                slow_ratio = alpha if beta3 is not None else 0.0
+                # Bug 4 fix: slow_ratio must include bias-correction ratio bc1/bc3
+                if beta3 is not None:
+                    step_val = _get_value(d_steps[0])
+                    bc1_val = 1.0 - (beta1 ** step_val)
+                    bc3_val = 1.0 - (beta3 ** step_val)
+                    slow_ratio = alpha * (bc1_val / bc3_val)
+                else:
+                    slow_ratio = 0.0
             else:
                 step = _get_value(d_steps[0])
                 bc1 = 1.0 - (beta1 ** step)
@@ -1565,7 +1604,7 @@ class ApexW(Optimizer):
                 if (target_dtype == torch.float16)
                 else eps
             )
-            if not capturable:
+            if not use_tensor_steps:
                 eps_scaled = effective_eps * bc2_sqrt
 
             # Bounded Chunking: Partition tensor list so temporary memory never exceeds <= 16 MB
@@ -1576,8 +1615,8 @@ class ApexW(Optimizer):
                 d_exp_avgs_slow if beta3 is not None else None,
                 d_exp_avg_sqs if not lion else None,
                 d_max_exp_avg_sqs if amsgrad else None,
-                step_size_list if capturable else None,
-                bc2_sqrt_list if capturable else None,
+                step_size_list if use_tensor_steps else None,
+                bc2_sqrt_list if use_tensor_steps else None,
             )
 
             for (
@@ -1644,7 +1683,7 @@ class ApexW(Optimizer):
                 # Vectorized denominator computation
                 denoms = torch._foreach_sqrt(v_sources)
 
-                if capturable:
+                if use_tensor_steps:
                     if scale_v != 1.0:
                         torch._foreach_div_(denoms, c_bc2_sqrt_list)
                         torch._foreach_add_(denoms, effective_eps * sqrt_scale_v)
@@ -1663,7 +1702,7 @@ class ApexW(Optimizer):
 
                 # Standard AdamW path (Zero extra numerator allocations, natively handles mixed precision)
                 if not cautious and not nesterov and beta3 is None:
-                    if capturable:
+                    if use_tensor_steps:
                         torch._foreach_addcdiv_(c_params, c_exp_avgs, denoms)
                     else:
                         torch._foreach_addcdiv_(c_params, c_exp_avgs, denoms, value=-step_size)
@@ -1697,7 +1736,7 @@ class ApexW(Optimizer):
                         mask.div_(mask_mean)
                         nums[idx] = nums[idx] * mask
 
-                    if capturable:
+                    if use_tensor_steps:
                         torch._foreach_addcdiv_(c_params, nums, denoms)
                     else:
                         torch._foreach_addcdiv_(c_params, nums, denoms, value=-step_size)
@@ -1705,7 +1744,7 @@ class ApexW(Optimizer):
 
                 elif nesterov and beta3 is None:
                     grads_f = [g.float() for g in c_grads] if c_grads[0].dtype != torch.float32 else c_grads
-                    if capturable:
+                    if use_tensor_steps:
                         nums = [torch.lerp(g, m, beta1) for g, m in zip(grads_f, exp_avgs_f)]
                         torch._foreach_addcdiv_(c_params, nums, denoms)
                         del nums
@@ -1713,7 +1752,7 @@ class ApexW(Optimizer):
                         torch._foreach_addcdiv_(c_params, exp_avgs_f, denoms, value=-step_size * beta1)
                         torch._foreach_addcdiv_(c_params, grads_f, denoms, value=-step_size * (1.0 - beta1))
                 else:
-                    if capturable:
+                    if use_tensor_steps:
                         torch._foreach_addcdiv_(c_params, nums, denoms)
                     else:
                         torch._foreach_addcdiv_(c_params, nums, denoms, value=-step_size)
