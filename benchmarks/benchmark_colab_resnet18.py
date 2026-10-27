@@ -180,7 +180,21 @@ def build_optimizer_configs():
     try:
         from optimizer import ApexW
 
+        # Fair comparison: match AdamW's default weight-decay behavior and full FP32 precision.
+        # decay_norm_only=False means all params are decayed (same as AdamW default).
+        # precision="full" keeps moments in FP32 (same as AdamW).
         configs["ApexW"] = lambda model: ApexW(
+            model.parameters(),
+            lr=LR,
+            weight_decay=WEIGHT_DECAY,
+            decay_norm_only=False,
+            precision="full",
+            dynamic_scaling=False,
+        )
+
+        # Production-optimized variant: compact 16-bit moments + norm-only decay.
+        # This shows the memory/speed tradeoff when ApexW's own defaults are used.
+        configs["ApexW (Optimized)"] = lambda model: ApexW(
             model.parameters(),
             lr=LR,
             weight_decay=WEIGHT_DECAY,
