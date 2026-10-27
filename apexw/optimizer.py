@@ -1,5 +1,6 @@
 import math
 from collections import defaultdict
+from collections.abc import MutableMapping
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -119,6 +120,61 @@ def _get_value(x):
     if isinstance(x, Tensor):
         return x.item()
     return x
+
+
+class PackedStateProxy(MutableMapping):
+    """Provides transparent, sliced access into the flat optimizer state for individual packed parameters."""
+
+    def __init__(self, flat_state: dict, offset: int, numel: int, shape: torch.Size):
+        self._flat_state = flat_state
+        self._offset = offset
+        self._numel = numel
+        self._shape = shape
+
+    def __getitem__(self, key):
+        val = self._flat_state[key]
+        if isinstance(val, Tensor) and val.numel() > 1:
+            if val.dim() == 2 and val.shape[-1] == 1:
+                return val[self._offset : self._offset + self._numel, 0].view(self._shape)
+            return val[self._offset : self._offset + self._numel].view(self._shape)
+        return val
+
+    def __setitem__(self, key, value):
+        self._flat_state[key] = value
+
+    def __delitem__(self, key):
+        del self._flat_state[key]
+
+    def __iter__(self):
+        return iter(self._flat_state)
+
+    def __len__(self):
+        return len(self._flat_state)
+
+    def __contains__(self, key):
+        return key in self._flat_state
+
+
+class StateDictWrapper(defaultdict):
+    """Wraps optimizer.state to transparently support state lookup for auto-packed parameters."""
+
+    def __init__(self, opt, initial_state=None):
+        super().__init__(dict)
+        self._opt = opt
+        if initial_state:
+            self.update(initial_state)
+
+    def __getitem__(self, p):
+        if hasattr(self._opt, "_param_to_packed") and id(p) in self._opt._param_to_packed:
+            flat_param, offset, numel, shape = self._opt._param_to_packed[id(p)]
+            return PackedStateProxy(super().__getitem__(flat_param), offset, numel, shape)
+        return super().__getitem__(p)
+
+    def __contains__(self, p):
+        if hasattr(self._opt, "_param_to_packed") and id(p) in self._opt._param_to_packed:
+            flat_param, _, _, _ = self._opt._param_to_packed[id(p)]
+            return flat_param in self
+        return super().__contains__(p)
 
 
 def _chunk_tensor_lists(
@@ -284,6 +340,8 @@ class ApexW(Optimizer):
         dynamic_scaling: bool = True, # Layer-wise dynamic range scaling to protect precision during long runs
         differentiable: bool = False,
         backend: Optional[str] = None, # None / "auto", "triton", "cuda", "mps", "foreach", "xla"
+        auto_pack: bool = False,       # Automatically pack small tensors into contiguous flat buffers
+        pack_threshold: int = 50000,   # Maximum numel for tensors to be auto-packed
     ):
         if differentiable:
             raise NotImplementedError("ApexW does not currently support differentiable=True.")
@@ -333,9 +391,82 @@ class ApexW(Optimizer):
             sqrt_layer_scale_v=1.0,
             differentiable=differentiable,
             backend=backend,
+            auto_pack=auto_pack,
+            pack_threshold=pack_threshold,
         )
         super().__init__(params, defaults)
         self._workspace_pool = {}
+        self.auto_pack = auto_pack
+        self.pack_threshold = pack_threshold
+        self.packed_param_groups: List[Dict[str, Any]] = []
+        self._param_to_packed: Dict[int, Tuple] = {}
+        if self.auto_pack:
+            self._setup_auto_packing()
+
+    def _setup_auto_packing(self):
+        """
+        Inspects parameter groups, partitions small parameters by (device, dtype, is_1d),
+        packs each subgroup into a single contiguous flat buffer, and repoints p.data so
+        layer attributes update in-place with zero copy while preserving weight decay semantics.
+        """
+        self.state = StateDictWrapper(self, self.state)
+
+        for group in self.param_groups:
+            buckets = defaultdict(list)
+            large_params = []
+
+            for p in group["params"]:
+                if p.requires_grad and p.numel() < self.pack_threshold:
+                    is_1d = (p.dim() < 2)
+                    buckets[(p.device, p.dtype, is_1d)].append(p)
+                else:
+                    large_params.append(p)
+
+            new_group_params = list(large_params)
+
+            for (dev, dt, is_1d), small_params in buckets.items():
+                if len(small_params) > 1:
+                    if is_1d:
+                        flat_tensor = nn.Parameter(
+                            torch.cat([p.detach().contiguous().view(-1) for p in small_params]),
+                            requires_grad=True,
+                        )
+                        offset = 0
+                        for p in small_params:
+                            numel = p.numel()
+                            p.data = flat_tensor.data[offset : offset + numel].view_as(p)
+                            self._param_to_packed[id(p)] = (flat_tensor, offset, numel, p.shape)
+                            offset += numel
+                    else:
+                        cat_flat = torch.cat([p.detach().contiguous().view(-1) for p in small_params]).unsqueeze(-1)
+                        flat_tensor = nn.Parameter(cat_flat, requires_grad=True)
+                        offset = 0
+                        for p in small_params:
+                            numel = p.numel()
+                            p.data = flat_tensor.data[offset : offset + numel, 0].view_as(p)
+                            self._param_to_packed[id(p)] = (flat_tensor, offset, numel, p.shape)
+                            offset += numel
+
+                    self.packed_param_groups.append({
+                        "flat_param": flat_tensor,
+                        "individual_params": small_params,
+                        "is_1d": is_1d,
+                    })
+                    new_group_params.append(flat_tensor)
+                else:
+                    new_group_params.extend(small_params)
+
+            group["params"] = new_group_params
+
+    def zero_grad(self, set_to_none: bool = True):
+        super().zero_grad(set_to_none=set_to_none)
+        if getattr(self, "auto_pack", False):
+            for packed in self.packed_param_groups:
+                for p in packed["individual_params"]:
+                    if set_to_none:
+                        p.grad = None
+                    elif p.grad is not None:
+                        p.grad.zero_()
 
     def __setstate__(self, state):
         super().__setstate__(state)
@@ -558,6 +689,25 @@ class ApexW(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        # Synchronize individual parameter gradients into flat gradient buffers for auto-packed groups
+        if getattr(self, "auto_pack", False):
+            for packed in self.packed_param_groups:
+                flat_param = packed["flat_param"]
+                individual_params = packed["individual_params"]
+                is_1d = packed["is_1d"]
+
+                if any(p.grad is not None for p in individual_params):
+                    grads = []
+                    for p in individual_params:
+                        if p.grad is not None:
+                            grads.append(p.grad.detach().contiguous().view(-1))
+                        else:
+                            grads.append(torch.zeros(p.numel(), dtype=p.dtype, device=p.device))
+                    cat_grad = torch.cat(grads)
+                    flat_param.grad = cat_grad if is_1d else cat_grad.unsqueeze(-1)
+                else:
+                    flat_param.grad = None
 
         for group in self.param_groups:
             params_with_grad: List[Tensor] = []
