@@ -1,3 +1,0 @@
-apexw
-build
-dist
