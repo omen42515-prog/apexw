@@ -157,7 +157,10 @@ def get_memory_breakdown(
     # Calculate optimizer state memory
     adamw_equiv_mb = (sum(p.numel() for p in model.parameters()) * 8) / (1024 * 1024)
     if optimizer is not None:
-        if hasattr(optimizer, "get_state_memory_mb") and len(optimizer.state) > 0:
+        has_stepped = len(optimizer.state) > 0 or (
+            hasattr(optimizer, "_local_opt") and len(optimizer._local_opt.state) > 0
+        )
+        if hasattr(optimizer, "get_state_memory_mb") and has_stepped:
             opt_state_mb = optimizer.get_state_memory_mb()
         else:
             opt_bytes = sum(
@@ -180,16 +183,33 @@ def get_memory_breakdown(
     is_cuda = (dev.type == "cuda" if isinstance(dev, torch.device) else "cuda" in str(dev)) and torch.cuda.is_available()
 
     if input_tensor is not None and is_cuda:
-        torch.cuda.reset_peak_memory_stats(dev)
-        mem_before = torch.cuda.memory_allocated(dev)
-        out = model(input_tensor)
-        mem_after_fwd = torch.cuda.memory_allocated(dev)
-        activation_mb = max(0.0, (mem_after_fwd - mem_before) / (1024 * 1024))
+        # Save model state before profiling to avoid polluting a live training loop
+        was_training = model.training
+        saved_grads = {p: p.grad.clone() if p.grad is not None else None for p in model.parameters()}
+        try:
+            model.eval()
+            torch.cuda.reset_peak_memory_stats(dev)
+            mem_before = torch.cuda.memory_allocated(dev)
+            with torch.no_grad():
+                out = model(input_tensor)
+            mem_after_fwd = torch.cuda.memory_allocated(dev)
+            activation_mb = max(0.0, (mem_after_fwd - mem_before) / (1024 * 1024))
 
-        if target is not None and criterion is not None:
-            loss = criterion(out, target)
-            loss.backward()
-            peak_vram_mb = torch.cuda.max_memory_allocated(dev) / (1024 * 1024)
+            if target is not None and criterion is not None:
+                # Re-enable grad only for the backward pass measurement
+                model.train()
+                out = model(input_tensor)
+                loss = criterion(out, target)
+                loss.backward()
+                peak_vram_mb = torch.cuda.max_memory_allocated(dev) / (1024 * 1024)
+        finally:
+            # Restore training mode and original gradients
+            if was_training:
+                model.train()
+            else:
+                model.eval()
+            for p in model.parameters():
+                p.grad = saved_grads[p]
 
     # Formulate architectural advice
     if activation_mb is not None and activation_mb > (param_mb + opt_state_mb) * 2:
