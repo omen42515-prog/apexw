@@ -2197,6 +2197,95 @@ class TestParameterFlattening(unittest.TestCase):
         for k in sd_orig:
             self.assertTrue(torch.equal(sd_orig[k], sd_exported[k]))
 
+    def test_auto_pack_initialization_and_parity(self):
+        """Verify native auto_pack=True packs small parameters and achieves bit-for-bit parity with unflattened."""
+        from apexw import ApexW
+
+        torch.manual_seed(42)
+        m_ref = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 2))
+        m_pack = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 2))
+        m_pack.load_state_dict(m_ref.state_dict())
+
+        opt_ref = ApexW(m_ref.parameters(), lr=0.01, auto_pack=False, precision="full")
+        opt_pack = ApexW(m_pack.parameters(), lr=0.01, auto_pack=True, pack_threshold=50000, precision="full")
+
+        self.assertGreater(len(opt_pack.packed_param_groups), 0)
+        # 4 original parameters (2 weights, 2 biases) packed into 2 flat buffers (1 for 2D, 1 for 1D)
+        self.assertEqual(len(opt_pack.param_groups[0]["params"]), 2)
+
+        for _ in range(5):
+            x = torch.randn(4, 8)
+            opt_ref.zero_grad()
+            m_ref(x).sum().backward()
+            opt_ref.step()
+
+            opt_pack.zero_grad()
+            m_pack(x).sum().backward()
+            opt_pack.step()
+
+        for p_ref, p_pack in zip(m_ref.parameters(), m_pack.parameters()):
+            self.assertTrue(
+                torch.allclose(p_ref, p_pack, atol=1e-6),
+                f"Auto-pack mismatch: {p_ref} vs {p_pack}",
+            )
+
+    def test_auto_pack_zero_grad_and_state_proxy(self):
+        """Verify auto_pack zero_grad cleans original gradients and opt.state[p] proxy works transparently."""
+        from apexw import ApexW
+
+        model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 2))
+        opt = ApexW(model.parameters(), lr=0.01, auto_pack=True)
+
+        x = torch.randn(2, 4)
+        model(x).sum().backward()
+        p0 = list(model.parameters())[0]
+        self.assertIsNotNone(p0.grad)
+
+        opt.step()
+
+        # State proxy should allow transparent inspection of individual parameters
+        self.assertIn(p0, opt.state)
+        self.assertEqual(opt.state[p0]["exp_avg"].shape, p0.shape)
+        self.assertEqual(opt.state[p0]["exp_avg_sq"].shape, p0.shape)
+        self.assertEqual(opt.state[p0]["step"].item(), 1.0)
+
+        # zero_grad with set_to_none=True
+        opt.zero_grad(set_to_none=True)
+        for p in model.parameters():
+            self.assertIsNone(p.grad)
+
+        # zero_grad with set_to_none=False
+        model(x).sum().backward()
+        opt.zero_grad(set_to_none=False)
+        for p in model.parameters():
+            self.assertIsNotNone(p.grad)
+            self.assertEqual(p.grad.abs().sum().item(), 0.0)
+
+    def test_auto_pack_decay_norm_preservation(self):
+        """Verify auto_pack preserves decay_norm_only semantics (applies WD to 2D weights, skips 1D norms/biases)."""
+        from apexw import ApexW
+
+        torch.manual_seed(42)
+        m_ref = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 2))
+        m_pack = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 2))
+        m_pack.load_state_dict(m_ref.state_dict())
+
+        opt_ref = ApexW(m_ref.parameters(), lr=0.01, weight_decay=0.05, decay_norm_only=True, precision="full", auto_pack=False)
+        opt_pack = ApexW(m_pack.parameters(), lr=0.01, weight_decay=0.05, decay_norm_only=True, precision="full", auto_pack=True)
+
+        for _ in range(5):
+            x = torch.randn(4, 8)
+            opt_ref.zero_grad()
+            m_ref(x).sum().backward()
+            opt_ref.step()
+
+            opt_pack.zero_grad()
+            m_pack(x).sum().backward()
+            opt_pack.step()
+
+        for p_ref, p_pack in zip(m_ref.parameters(), m_pack.parameters()):
+            self.assertTrue(torch.allclose(p_ref, p_pack, atol=1e-6))
+
 
 if __name__ == "__main__":
     unittest.main()
