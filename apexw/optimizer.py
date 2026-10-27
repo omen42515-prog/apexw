@@ -1112,23 +1112,12 @@ class ApexW(Optimizer):
 
         # Precompute step-level scalars once outside the loop for maximum CPU throughput
         decay_factor = 1.0 - lr * weight_decay if weight_decay != 0 else 1.0
-        hoisted_step_computed = False
         step_size = None
         eps_scaled = None
         slow_ratio = 0.0
-
-        if not capturable and not compiling and len(state_steps) > 0:
-            first_step = _get_value(state_steps[0]) + 1.0
-            bc1 = 1.0 - (beta1 ** first_step)
-            bc2 = 1.0 - (beta2 ** first_step)
-            bc2_sqrt = math.sqrt(bc2)
-            step_size = lr * bc2_sqrt / bc1
-            first_m = exp_avgs[0] if len(exp_avgs) > 0 else None
-            effective_eps = max(eps, 6.1e-5) if (first_m is not None and first_m.dtype == torch.float16) else eps
-            eps_scaled = effective_eps * bc2_sqrt
-            if beta3 is not None:
-                slow_ratio = alpha * (bc1 / (1.0 - (beta3 ** first_step)))
-            hoisted_step_computed = True
+        # Cache bias-correction scalars by (step, effective_eps) so parameters sharing
+        # the same step count reuse precomputed scalars without redundant math.
+        step_cache = {}
 
         for i, p in enumerate(params):
             g = grads[i] if not maximize else -grads[i]
@@ -1165,14 +1154,19 @@ class ApexW(Optimizer):
                 step_size = lr / bc1
                 step_size_neg = step_size.neg()
                 slow_ratio = alpha * (bc1 / (1.0 - torch.pow(beta3, step))) if beta3 is not None else 0.0
-            elif not hoisted_step_computed:
+            else:
                 step = _get_value(step_t)
-                bc1 = 1.0 - (beta1 ** step)
-                bc2 = 1.0 - (beta2 ** step)
-                bc2_sqrt = math.sqrt(bc2)
-                step_size = lr * bc2_sqrt / bc1
-                eps_scaled = effective_eps * bc2_sqrt
-                slow_ratio = alpha * (bc1 / (1.0 - (beta3 ** step))) if beta3 is not None else 0.0
+                cache_key = (step, effective_eps)
+                if cache_key in step_cache:
+                    step_size, eps_scaled, slow_ratio, bc2_sqrt = step_cache[cache_key]
+                else:
+                    bc1 = 1.0 - (beta1 ** step)
+                    bc2 = 1.0 - (beta2 ** step)
+                    bc2_sqrt = math.sqrt(bc2)
+                    step_size = lr * bc2_sqrt / bc1
+                    eps_scaled = effective_eps * bc2_sqrt
+                    slow_ratio = alpha * (bc1 / (1.0 - (beta3 ** step))) if beta3 is not None else 0.0
+                    step_cache[cache_key] = (step_size, eps_scaled, slow_ratio, bc2_sqrt)
 
             # 2. Decoupled weight decay
             if weight_decay != 0:
@@ -1192,12 +1186,22 @@ class ApexW(Optimizer):
 
             # 4. Standard AdamW / AdEMAMix update
             state_dtype = m.dtype
-            g_comp = g if g.dtype == state_dtype else g.to(state_dtype)
 
-            # Update first-order momentum
-            m.lerp_(g_comp, 1.0 - beta1)
-            if m_slow is not None:
-                m_slow.lerp_(g_comp, 1.0 - beta3)
+            # Numerical Contract: FP32 arithmetic with compact (16-bit) state storage.
+            # Consistent with Triton GPU and C++/CUDA fused kernels, arithmetic is evaluated
+            # in float32 to prevent truncation/underflow in gradient moving averages, then
+            # stored back into the compact 16-bit state buffers.
+            if state_dtype in (torch.bfloat16, torch.float16):
+                g_f = g.float()
+                m_f = m.float().lerp_(g_f, 1.0 - beta1)
+                m.copy_(m_f)
+                if m_slow is not None:
+                    m_slow_f = m_slow.float().lerp_(g_f, 1.0 - beta3)
+                    m_slow.copy_(m_slow_f)
+            else:
+                m.lerp_(g, 1.0 - beta1)
+                if m_slow is not None:
+                    m_slow.lerp_(g, 1.0 - beta3)
 
             # Dynamic range scaling for 16-bit variance states (prevents underflow)
             scale_v = 1.0
@@ -1244,7 +1248,11 @@ class ApexW(Optimizer):
                             p_state["sqrt_scale_v"] = sqrt_scale_v
 
             # Update second-order momentum with dynamic scale
-            v.mul_(beta2).addcmul_(g_comp, g_comp, value=(1.0 - beta2) * scale_v)
+            if state_dtype in (torch.bfloat16, torch.float16):
+                v_f = v.float().mul_(beta2).addcmul_(g_f, g_f, value=(1.0 - beta2) * scale_v)
+                v.copy_(v_f)
+            else:
+                v.mul_(beta2).addcmul_(g, g, value=(1.0 - beta2) * scale_v)
 
             # Fast path for standard AdamW (zero extra allocations)
             if not amsgrad and not cautious and not nesterov and m_slow is None:
@@ -1359,7 +1367,11 @@ class ApexW(Optimizer):
 
         for i, p in enumerate(params):
             m = exp_avgs[i]
-            key = (p.device, p.dtype, m.dtype)
+            # When not capturable and not compiling, partition also by current step count
+            # so each subgroup is guaranteed uniform step counts. This ensures bias-correction
+            # scalars are mathematically exact for every parameter, even with intermittent gradients.
+            s_val = int(_get_value(state_steps[i])) if (not capturable and not compiling) else None
+            key = (p.device, p.dtype, m.dtype, s_val)
             sg = subgroups[key]
             sg["params"].append(p)
             sg["grads"].append(grads[i])
@@ -1372,7 +1384,7 @@ class ApexW(Optimizer):
                 if amsgrad:
                     sg["max_exp_avg_sqs"].append(max_exp_avg_sqs[i])
 
-        for (dev, param_dt, state_dt), sg in subgroups.items():
+        for (dev, param_dt, state_dt, _), sg in subgroups.items():
             d_params = sg["params"]
             d_grads = sg["grads"]
             d_exp_avgs = sg["exp_avgs"]
@@ -1588,14 +1600,36 @@ class ApexW(Optimizer):
                     del updates, c_grads_comp
                     continue
 
-                # Update first-order momentum
-                torch._foreach_lerp_(c_exp_avgs, c_grads_comp, 1.0 - beta1)
-                if beta3 is not None:
-                    torch._foreach_lerp_(c_exp_avgs_slow, c_grads_comp, 1.0 - beta3)
+                # Numerical Contract: FP32 arithmetic with compact (16-bit) state storage.
+                # Aligns multi-tensor CPU/fallback with Triton and CUDA kernels by accumulating
+                # moving averages in float32 before storing back into compact 16-bit buffers.
+                if target_dtype in (torch.bfloat16, torch.float16):
+                    c_grads_f = [g.float() for g in c_grads]
+                    c_exp_avgs_f = [m.float() for m in c_exp_avgs]
+                    torch._foreach_lerp_(c_exp_avgs_f, c_grads_f, 1.0 - beta1)
+                    for dst, src in zip(c_exp_avgs, c_exp_avgs_f):
+                        dst.copy_(src)
 
-                # Update second-order momentum with dynamic range scale
-                torch._foreach_mul_(c_exp_avg_sqs, beta2)
-                torch._foreach_addcmul_(c_exp_avg_sqs, c_grads_comp, c_grads_comp, value=(1.0 - beta2) * scale_v)
+                    if beta3 is not None:
+                        c_exp_avgs_slow_f = [m.float() for m in c_exp_avgs_slow]
+                        torch._foreach_lerp_(c_exp_avgs_slow_f, c_grads_f, 1.0 - beta3)
+                        for dst, src in zip(c_exp_avgs_slow, c_exp_avgs_slow_f):
+                            dst.copy_(src)
+
+                    c_exp_avg_sqs_f = [v.float() for v in c_exp_avg_sqs]
+                    torch._foreach_mul_(c_exp_avg_sqs_f, beta2)
+                    torch._foreach_addcmul_(c_exp_avg_sqs_f, c_grads_f, c_grads_f, value=(1.0 - beta2) * scale_v)
+                    for dst, src in zip(c_exp_avg_sqs, c_exp_avg_sqs_f):
+                        dst.copy_(src)
+                else:
+                    # Update first-order momentum
+                    torch._foreach_lerp_(c_exp_avgs, c_grads, 1.0 - beta1)
+                    if beta3 is not None:
+                        torch._foreach_lerp_(c_exp_avgs_slow, c_grads, 1.0 - beta3)
+
+                    # Update second-order momentum with dynamic range scale
+                    torch._foreach_mul_(c_exp_avg_sqs, beta2)
+                    torch._foreach_addcmul_(c_exp_avg_sqs, c_grads, c_grads, value=(1.0 - beta2) * scale_v)
 
                 if amsgrad:
                     torch._foreach_maximum_(c_max_exp_avg_sqs, c_exp_avg_sqs)
