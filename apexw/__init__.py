@@ -15,6 +15,7 @@ from .cuda_extension import is_cuda_kernel_available
 from .triton_kernel import is_triton_available, is_rocm
 from .xla_support import is_xla_available, is_xla_device
 from .checkpointing import apply_activation_checkpointing, CheckpointWrapper, get_memory_breakdown
+from .flatten import flatten_parameters, is_flattened
 
 __all__ = [
     "ApexW",
@@ -28,5 +29,7 @@ __all__ = [
     "apply_activation_checkpointing",
     "CheckpointWrapper",
     "get_memory_breakdown",
+    "flatten_parameters",
+    "is_flattened",
 ]
 __version__ = "1.2.0"
