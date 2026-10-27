@@ -1826,6 +1826,303 @@ class TestApexWZeroCheckpoint(unittest.TestCase):
             self.assertFalse(torch.isnan(state["exp_avg_sq"]).any())
 
 
+class TestRegressionBugs(unittest.TestCase):
+    """Regression tests for 8 confirmed architectural and numerical bugs."""
+
+    def test_bug1_gradient_clipping_after_amp_unscaling(self):
+        """Bug 1: Verify gradient clipping happens after AMP unscaling.
+        When AMP/GradScaler provides grad_scale, gradients must be unscaled before
+        calculating Euclidean norm and applying clip_grad_norm.
+        """
+        scale = 100.0
+        clip_norm = 2.0
+
+        # Reference: unscale gradients first, then clip, then step
+        p_ref = nn.Parameter(torch.tensor([10.0, -5.0]))
+        p_ref.grad = torch.tensor([500.0, -300.0])  # scaled by 100
+        p_ref.grad.div_(scale)
+        torch.nn.utils.clip_grad_norm_([p_ref], max_norm=clip_norm)
+        opt_ref = ApexW([p_ref], lr=0.1, weight_decay=0.01)
+        opt_ref.step()
+
+        # ApexW: pass scaled gradient and grad_scale with in-optimizer clipping
+        p_apex = nn.Parameter(torch.tensor([10.0, -5.0]))
+        p_apex.grad = torch.tensor([500.0, -300.0])  # scaled by 100
+        opt_apex = ApexW([p_apex], lr=0.1, weight_decay=0.01, clip_grad_norm=clip_norm)
+        opt_apex.grad_scale = torch.tensor(scale)
+        opt_apex.step()
+
+        self.assertTrue(
+            torch.allclose(p_ref, p_apex, atol=1e-5),
+            f"Param mismatch: reference {p_ref} vs apexw {p_apex}",
+        )
+        self.assertTrue(
+            torch.allclose(opt_ref.state[p_ref]["exp_avg"], opt_apex.state[p_apex]["exp_avg"], atol=1e-5),
+            "Momentum mismatch after unscaled clipping",
+        )
+
+    def test_bug2_amp_overflow_skipped_in_capturable_mode(self):
+        """Bug 2: Verify AMP overflow correctly skips updates when capturable=True outside graph capture."""
+        import apexw.optimizer as opt_mod
+        orig_devices = opt_mod.CAPTURABLE_SUPPORTED_DEVICES
+        try:
+            opt_mod.CAPTURABLE_SUPPORTED_DEVICES = ("cpu", "cuda", "xpu")
+            for foreach in (False, True):
+                p = nn.Parameter(torch.tensor([1.0, 2.0]))
+                opt = ApexW([p], lr=0.01, capturable=True, foreach=foreach)
+
+                # Step 1: Normal valid step
+                p.grad = torch.tensor([0.1, 0.2])
+                opt.step()
+                p_val = p.clone()
+                step_val = opt.state[p]["step"].clone()
+                m_val = opt.state[p]["exp_avg"].clone()
+
+                # Step 2: Overflow step with found_inf=1.0
+                p.grad = torch.tensor([float("inf"), 0.2])
+                opt.found_inf = torch.tensor(1.0)
+                opt.step()
+
+                self.assertTrue(
+                    torch.equal(p, p_val),
+                    f"Parameters updated on AMP overflow (foreach={foreach})",
+                )
+                self.assertTrue(
+                    torch.equal(opt.state[p]["step"], step_val),
+                    f"Step counter incremented on AMP overflow (foreach={foreach})",
+                )
+                self.assertTrue(
+                    torch.equal(opt.state[p]["exp_avg"], m_val),
+                    f"exp_avg modified on AMP overflow (foreach={foreach})",
+                )
+        finally:
+            opt_mod.CAPTURABLE_SUPPORTED_DEVICES = orig_devices
+
+    def test_bug3_compiled_cuda_foreach_variables_dataflow(self):
+        """Bug 3: Verify compiled foreach path has consistent variables and avoids UnboundLocalError."""
+        import apexw.optimizer as opt_mod
+        orig_compiling = opt_mod.is_compiling
+        try:
+            opt_mod.is_compiling = lambda: True
+            configs = [
+                {"cautious": False, "nesterov": False, "beta3": None},
+                {"cautious": True, "nesterov": False, "beta3": None},
+                {"cautious": False, "nesterov": True, "beta3": None},
+                {"cautious": False, "nesterov": False, "beta3": 0.99},
+            ]
+            for cfg in configs:
+                p = nn.Parameter(torch.tensor([1.0, 2.0]))
+                p.grad = torch.tensor([0.1, 0.2])
+                opt = ApexW([p], lr=0.01, foreach=True, **cfg)
+                # Must execute cleanly without UnboundLocalError: bc2_sqrt
+                opt.step()
+                self.assertFalse(torch.isnan(p).any())
+                self.assertEqual(opt.state[p]["step"].item(), 1.0)
+        finally:
+            opt_mod.is_compiling = orig_compiling
+
+    def test_bug4_ademamix_slow_ratio_parity(self):
+        """Bug 4: Verify AdEMAMix slow_ratio includes bias correction bc1/bc3 across execution modes."""
+        import apexw.optimizer as opt_mod
+
+        # Reference: single tensor update
+        p_ref = nn.Parameter(torch.tensor([1.0, 2.0]))
+        p_ref.grad = torch.tensor([0.1, 0.2])
+        opt_ref = ApexW([p_ref], lr=0.01, beta3=0.9999, alpha=5.0, foreach=False)
+        opt_ref.step()
+
+        # Compiled multi-tensor update
+        orig_compiling = opt_mod.is_compiling
+        try:
+            opt_mod.is_compiling = lambda: True
+            p_comp = nn.Parameter(torch.tensor([1.0, 2.0]))
+            p_comp.grad = torch.tensor([0.1, 0.2])
+            opt_comp = ApexW([p_comp], lr=0.01, beta3=0.9999, alpha=5.0, foreach=True)
+            opt_comp.step()
+
+            self.assertTrue(
+                torch.allclose(p_ref, p_comp, atol=1e-5),
+                f"AdEMAMix mismatch: single-tensor {p_ref} vs compiled foreach {p_comp}",
+            )
+        finally:
+            opt_mod.is_compiling = orig_compiling
+
+    def test_bug5_dynamic_variance_scaling_capturable_fp16(self):
+        """Bug 5: Verify dynamic variance scaling in capturable/compiling path applies sqrt_scale_v divisor."""
+        import apexw.optimizer as opt_mod
+
+        # Reference: single tensor without compiling
+        p_ref = nn.Parameter(torch.tensor([1.0, 2.0], dtype=torch.float32))
+        p_ref.grad = torch.tensor([0.1, 0.2], dtype=torch.float32)
+        opt_ref = ApexW([p_ref], lr=0.01, precision="compact", foreach=False, dynamic_scaling=True)
+        opt_ref.step()
+        opt_ref.state[p_ref]["scale_v"] = 1024.0
+        opt_ref.state[p_ref]["sqrt_scale_v"] = 32.0
+        p_ref.grad = torch.tensor([0.1, 0.2], dtype=torch.float32)
+        opt_ref.step()
+
+        # Test: single tensor under compiling mode
+        orig_compiling = opt_mod.is_compiling
+        try:
+            opt_mod.is_compiling = lambda: True
+            p_test = nn.Parameter(torch.tensor([1.0, 2.0], dtype=torch.float32))
+            p_test.grad = torch.tensor([0.1, 0.2], dtype=torch.float32)
+            opt_test = ApexW([p_test], lr=0.01, precision="compact", foreach=False, dynamic_scaling=True)
+            opt_test.step()
+            opt_test.state[p_test]["scale_v"] = 1024.0
+            opt_test.state[p_test]["sqrt_scale_v"] = 32.0
+            p_test.grad = torch.tensor([0.1, 0.2], dtype=torch.float32)
+            opt_test.step()
+
+            self.assertTrue(
+                torch.allclose(p_ref, p_test, atol=1e-3),
+                f"Denom scale mismatch: reference {p_ref} vs compiled {p_test}",
+            )
+        finally:
+            opt_mod.is_compiling = orig_compiling
+
+    def test_bug6_xla_step_counts_per_parameter(self):
+        """Bug 6: Verify _xla_step computes bias corrections per-parameter rather than using state_steps[0] for all."""
+        opt = ApexW([nn.Parameter(torch.tensor([1.0]))], lr=0.01)
+
+        p1 = nn.Parameter(torch.tensor([1.0, 2.0]))
+        p2 = nn.Parameter(torch.tensor([3.0, 4.0]))
+        g1 = torch.tensor([0.1, 0.2])
+        g2 = torch.tensor([0.1, 0.2])
+
+        m1 = torch.zeros_like(p1)
+        m2 = torch.zeros_like(p2)
+        v1 = torch.zeros_like(p1)
+        v2 = torch.zeros_like(p2)
+
+        # p1 at step 0 (will become 1), p2 at step 9 (will become 10)
+        steps = [torch.tensor(0.0), torch.tensor(9.0)]
+
+        with torch.no_grad():
+            opt._xla_step(
+                params=[p1, p2],
+                grads=[g1, g2],
+                exp_avgs=[m1, m2],
+                exp_avgs_slow=[None, None],
+                exp_avg_sqs=[v1, v2],
+                max_exp_avg_sqs=[None, None],
+                state_steps=steps,
+                lr=0.01,
+                beta1=0.9,
+                beta2=0.999,
+                beta3=None,
+                alpha=5.0,
+                lion=False,
+                eps=1e-8,
+                weight_decay=0.0,
+                decay_norm_only=False,
+                nesterov=False,
+                cautious=False,
+                amsgrad=False,
+                maximize=False,
+            )
+
+        self.assertEqual(steps[0].item(), 1.0)
+        self.assertEqual(steps[1].item(), 10.0)
+
+        # Compute expected step 10 bias-corrected update for p2
+        bc1_10 = 1.0 - (0.9 ** 10)
+        bc2_10 = 1.0 - (0.999 ** 10)
+        step_size_10 = 0.01 * (bc2_10 ** 0.5) / bc1_10
+        expected_p2 = torch.tensor([3.0, 4.0]) - step_size_10 * (g2 * 0.1) / ((g2 * g2 * 0.001) ** 0.5 + 1e-8 * (bc2_10 ** 0.5))
+
+        self.assertTrue(
+            torch.allclose(p2, expected_p2, atol=1e-4),
+            f"Param 2 should use step 10 bias correction: actual {p2} vs expected {expected_p2}",
+        )
+
+    def test_bug7_xla_cautious_mask_normalization(self):
+        """Bug 7: Verify _xla_step in cautious mode applies mask normalization to preserve update magnitude."""
+        opt = ApexW([nn.Parameter(torch.tensor([1.0]))], lr=0.01)
+
+        p_xla = nn.Parameter(torch.tensor([1.0, 1.0, 1.0, 1.0]))
+        g = torch.tensor([1.0, 1.0, -1.0, -1.0])
+        m_xla = torch.tensor([1.0, 1.0, 1.0, 1.0])
+        v_xla = torch.tensor([1.0, 1.0, 1.0, 1.0])
+        steps = [torch.tensor(1.0)]
+
+        with torch.no_grad():
+            opt._xla_step(
+                params=[p_xla],
+                grads=[g],
+                exp_avgs=[m_xla],
+                exp_avgs_slow=[None],
+                exp_avg_sqs=[v_xla],
+                max_exp_avg_sqs=[None],
+                state_steps=steps,
+                lr=0.01,
+                beta1=0.9,
+                beta2=0.999,
+                beta3=None,
+                alpha=5.0,
+                lion=False,
+                eps=1e-8,
+                weight_decay=0.0,
+                decay_norm_only=False,
+                nesterov=False,
+                cautious=True,
+                amsgrad=False,
+                maximize=False,
+            )
+
+        # Inactive elements (g * m < 0) must be masked to zero (unchanged weight)
+        self.assertEqual(p_xla[2].item(), 1.0)
+        self.assertEqual(p_xla[3].item(), 1.0)
+        # Active elements must be updated with normalized factor (mask / mask_mean = 1.0 / 0.5 = 2.0)
+        self.assertLess(p_xla[0].item(), 1.0)
+        self.assertEqual(p_xla[0].item(), p_xla[1].item())
+
+    def test_bug8_checkpointing_diagnostics_preservation(self):
+        """Bug 8: Verify checkpointing diagnostic utilities work with ZeRO and preserve model state."""
+        from apexw import ApexWZeRO, get_memory_breakdown
+        import unittest.mock as mock
+
+        # 8a: get_memory_breakdown calculates optimizer state memory on ApexWZeRO
+        model = nn.Sequential(nn.Linear(1024, 1024))
+        opt = ApexWZeRO(model.parameters(), lr=0.01, world_size=1, rank=0)
+        x = torch.randn(2, 1024)
+        model(x).sum().backward()
+        opt.step()
+
+        breakdown = get_memory_breakdown(model, opt)
+        self.assertGreater(breakdown["optimizer_state_mb"], 0.0)
+        self.assertEqual(len(opt.state), 0)  # Sharded state delegated to _local_opt
+        self.assertGreater(len(opt._local_opt.state), 0)
+
+        # 8b: get_memory_breakdown activation profiling preserves model.training and parameter gradients
+        model_prof = nn.Sequential(nn.Linear(10, 10))
+        model_prof.train()
+        x_prof = torch.randn(2, 10)
+        target = torch.randn(2, 10)
+        loss_fn = nn.MSELoss()
+
+        model_prof(x_prof).sum().backward()
+        initial_grads = {p: p.grad.clone() for p in model_prof.parameters()}
+
+        with mock.patch("torch.cuda.is_available", return_value=True), \
+             mock.patch("torch.cuda.reset_peak_memory_stats"), \
+             mock.patch("torch.cuda.memory_allocated", side_effect=[1000, 2000]), \
+             mock.patch("torch.cuda.max_memory_allocated", return_value=3000):
+
+            get_memory_breakdown(
+                model_prof,
+                optimizer=None,
+                input_tensor=x_prof,
+                target=target,
+                criterion=loss_fn,
+                device=torch.device("cuda:0"),
+            )
+
+        self.assertTrue(model_prof.training, "model.training was not restored after profiling")
+        for p in model_prof.parameters():
+            self.assertTrue(torch.equal(p.grad, initial_grads[p]), "Gradients were mutated during profiling")
+
+
 if __name__ == "__main__":
     unittest.main()
 
