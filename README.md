@@ -13,7 +13,6 @@ ApexW runs on pure PyTorch across CPU, NVIDIA CUDA, Apple MPS, AMD ROCm, and Int
 Install in your existing PyTorch environment without breaking your CUDA setup:
 
 ```bash
-cd apexw
 pip install -r requirements.txt
 pip install -e .
 ```
