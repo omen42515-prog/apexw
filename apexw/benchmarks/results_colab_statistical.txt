@@ -1,0 +1,16 @@
+==========================================================================================
+STATISTICAL METRICS OVER 5 INDEPENDENT SEEDS (Mean, StdDev, 95% Confidence Interval)
+==========================================================================================
+
+[Optimizer: ApexW]
+  * steps_per_sec  : Mean = 530.7066 | Std = 107.1936 | 95% CI = (397.6082, 663.8050)
+  * val_loss       : Mean = 1.9788 | Std = 0.0023 | 95% CI = (1.9759, 1.9817)
+[Optimizer: AdamW Fused]
+  * steps_per_sec  : Mean = 497.1408 | Std = 34.8702 | 95% CI = (453.8437, 540.4378)
+  * val_loss       : Mean = 1.9772 | Std = 0.0023 | 95% CI = (1.9743, 1.9801)
+
+[Optimizer: Lion]
+  * steps_per_sec  : Mean = 275.2461 | Std = 6.7816 | 95% CI = (266.8256, 283.6665)
+  * val_loss       : Mean = 1.9775 | Std = 0.0020 | 95% CI = (1.9750, 1.9800)
+
+it was run on google collab

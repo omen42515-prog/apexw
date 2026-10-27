@@ -1,0 +1,3 @@
+# ApexW: Memory-Efficient Fused Optimizer for PyTorch
+# Minimum requirement: PyTorch 2.0+ (CPU, CUDA, MPS, ROCm, XPU)
+torch>=2.0.0
