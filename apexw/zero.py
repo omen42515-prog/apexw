@@ -247,3 +247,53 @@ class ApexWZeRO(Optimizer):
         local_mem = self.get_state_memory_mb()
         adam_equiv = sum(p.numel() * 8 for g in self.param_groups for p in g["params"]) / (1024 * 1024)
         return adam_equiv - local_mem
+
+    def state_dict(self):
+        """Returns checkpoint state including the inner optimizer and ZeRO shard metadata."""
+        local_sd = self._local_opt.state_dict()
+        # Capture shard layout so load_state_dict can validate topology compatibility
+        shard_meta = []
+        for e in self._sharded_param_map:
+            entry = {"type": e["type"]}
+            if e["type"] == "slice":
+                entry["start"] = e["start"]
+                entry["end"] = e["end"]
+                entry["dim0"] = e["dim0"]
+            else:
+                entry["owner_rank"] = e.get("owner_rank")
+            shard_meta.append(entry)
+
+        return {
+            "local_opt": local_sd,
+            "zero_meta": {
+                "rank": self.rank,
+                "world_size": self.world_size,
+                "shard_map": shard_meta,
+            },
+        }
+
+    def load_state_dict(self, state_dict):
+        """Restores inner optimizer state from a checkpoint produced by state_dict()."""
+        self._local_opt.load_state_dict(state_dict["local_opt"])
+
+        meta = state_dict.get("zero_meta", {})
+        saved_rank = meta.get("rank")
+        saved_world_size = meta.get("world_size")
+
+        if saved_world_size is not None and saved_world_size != self.world_size:
+            import warnings
+            warnings.warn(
+                f"ApexWZeRO: checkpoint was saved with world_size={saved_world_size}, "
+                f"but current world_size={self.world_size}. Optimizer state will be "
+                "loaded as-is; shard boundaries may not match the new topology.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if saved_rank is not None and saved_rank != self.rank:
+            import warnings
+            warnings.warn(
+                f"ApexWZeRO: checkpoint rank={saved_rank} loaded on rank={self.rank}. "
+                "This is expected when redistributing checkpoints across different ranks.",
+                UserWarning,
+                stacklevel=2,
+            )
