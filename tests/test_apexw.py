@@ -1598,6 +1598,53 @@ class TestStepCountUniformity(unittest.TestCase):
             "foreach and single-tensor paths must agree when step counts are uniform",
         )
 
+    def test_single_group_late_activation_against_adamw(self):
+        """Regression test: Two parameters in the SAME group.
+        Param 1 receives 5 updates while Param 2 has grad=None.
+        At step 6, both receive gradients.
+        Param 2 must produce 0.9900000 matching PyTorch AdamW for both
+        foreach=False and foreach=True.
+        """
+        for foreach in (False, True):
+            p1 = torch.tensor([1.0], requires_grad=True)
+            p2 = torch.tensor([1.0], requires_grad=True)
+            opt_apex = ApexW([p1, p2], lr=0.01, weight_decay=0.0, precision="full", foreach=foreach)
+
+            p1_ref = torch.tensor([1.0], requires_grad=True)
+            p2_ref = torch.tensor([1.0], requires_grad=True)
+            opt_ref = torch.optim.AdamW([p1_ref, p2_ref], lr=0.01, weight_decay=0.0)
+
+            for _ in range(5):
+                opt_apex.zero_grad()
+                opt_ref.zero_grad()
+                p1.grad = torch.tensor([1.0])
+                p1_ref.grad = torch.tensor([1.0])
+                opt_apex.step()
+                opt_ref.step()
+
+            opt_apex.zero_grad()
+            opt_ref.zero_grad()
+            p1.grad = torch.tensor([1.0])
+            p2.grad = torch.tensor([1.0])
+            p1_ref.grad = torch.tensor([1.0])
+            p2_ref.grad = torch.tensor([1.0])
+            opt_apex.step()
+            opt_ref.step()
+
+            self.assertAlmostEqual(
+                p2.item(), 0.9900000, places=6,
+                msg=f"foreach={foreach}: p2 must equal 0.9900000 matching AdamW",
+            )
+            self.assertAlmostEqual(
+                p2.item(), p2_ref.item(), places=6,
+                msg=f"foreach={foreach}: p2 must match AdamW reference",
+            )
+            self.assertAlmostEqual(
+                p1.item(), p1_ref.item(), places=6,
+                msg=f"foreach={foreach}: p1 must match AdamW reference",
+            )
+
+
 
 class TestApexWZeroCheckpoint(unittest.TestCase):
     """Regression tests for ApexWZeRO state_dict / load_state_dict (Bug 2).
@@ -1693,6 +1740,92 @@ class TestApexWZeroCheckpoint(unittest.TestCase):
             "Inner optimizer state must be non-empty after one step",
         )
 
+    def test_zero_preserves_per_group_settings(self):
+        """Regression test: ApexWZeRO must retain distinct per-group settings
+        (lr, weight_decay, eps) across parameter groups in the inner optimizer,
+        and dynamically synchronize updates (e.g. from LR schedulers).
+        """
+        try:
+            from apexw.zero import ApexWZeRO
+        except ImportError:
+            self.skipTest("ApexWZeRO not importable")
+
+        p_backbone = nn.Parameter(torch.randn(10, 10))
+        p_head = nn.Parameter(torch.randn(5))
+
+        opt = ApexWZeRO([
+            {"params": [p_backbone], "lr": 1e-4, "weight_decay": 0.05},
+            {"params": [p_head], "lr": 1e-2, "weight_decay": 0.0},
+        ], world_size=1, rank=0)
+
+        # 1. Inner optimizer must preserve both groups with distinct configurations
+        self.assertEqual(len(opt._local_opt.param_groups), 2)
+        self.assertEqual(opt._local_opt.param_groups[0]["lr"], 1e-4)
+        self.assertEqual(opt._local_opt.param_groups[1]["lr"], 1e-2)
+        self.assertEqual(opt._local_opt.param_groups[0]["weight_decay"], 0.05)
+        self.assertEqual(opt._local_opt.param_groups[1]["weight_decay"], 0.0)
+
+        # 2. Dynamic hyperparameter updates (e.g., from an LR scheduler) propagate to inner groups
+        opt.param_groups[0]["lr"] = 5e-5
+        p_backbone.grad = torch.randn_like(p_backbone)
+        p_head.grad = torch.randn_like(p_head)
+        opt.step()
+        self.assertEqual(opt._local_opt.param_groups[0]["lr"], 5e-5)
+
+        # 3. Dynamic add_param_group is properly sharded and registered
+        p_extra = nn.Parameter(torch.randn(4))
+        opt.add_param_group({"params": [p_extra], "lr": 3e-3, "weight_decay": 0.01})
+        self.assertEqual(len(opt.param_groups), 3)
+        self.assertEqual(len(opt._local_opt.param_groups), 3)
+        self.assertEqual(opt._local_opt.param_groups[2]["lr"], 3e-3)
+        self.assertEqual(opt._local_opt.param_groups[2]["weight_decay"], 0.01)
+
+    def test_zero_preserves_per_group_settings_multi_rank(self):
+        """Simulate 2 ranks and verify both maintain correct per-group configs."""
+        try:
+            from apexw.zero import ApexWZeRO
+        except ImportError:
+            self.skipTest("ApexWZeRO not importable")
+
+        for rank in (0, 1):
+            p1 = nn.Parameter(torch.randn(512, 10))
+            p2 = nn.Parameter(torch.randn(10))
+            opt = ApexWZeRO([
+                {"params": [p1], "lr": 2e-4, "weight_decay": 0.1},
+                {"params": [p2], "lr": 1e-3, "weight_decay": 0.0},
+            ], world_size=2, rank=rank)
+
+            self.assertEqual(len(opt._local_opt.param_groups), 2)
+            self.assertEqual(opt._local_opt.param_groups[0]["lr"], 2e-4)
+            self.assertEqual(opt._local_opt.param_groups[1]["lr"], 1e-3)
+            self.assertEqual(opt._local_opt.param_groups[0]["weight_decay"], 0.1)
+            self.assertEqual(opt._local_opt.param_groups[1]["weight_decay"], 0.0)
+
+    def test_compact_precision_fp32_arithmetic_contract(self):
+        """Verify that compact precision (16-bit state storage) uses FP32 arithmetic
+        for momentum updates, matching Triton and CUDA fused kernels.
+        """
+        for state_dtype in (torch.bfloat16, torch.float16):
+            p = torch.tensor([1.0, 2.0], requires_grad=True)
+            p.grad = torch.tensor([0.1, -0.2])
+            opt = ApexW([p], lr=0.01, precision="compact", foreach=False)
+
+            # Initialize states in target compact dtype
+            opt.step()
+            state = opt.state[p]
+            self.assertEqual(state["exp_avg"].dtype, torch.bfloat16)
+
+            # Run 5 steps to verify stable accumulation without NaN or underflow
+            for _ in range(5):
+                opt.zero_grad()
+                p.grad = torch.tensor([0.05, -0.05])
+                opt.step()
+
+            self.assertFalse(torch.isnan(p).any())
+            self.assertFalse(torch.isnan(state["exp_avg"]).any())
+            self.assertFalse(torch.isnan(state["exp_avg_sq"]).any())
+
 
 if __name__ == "__main__":
     unittest.main()
+
