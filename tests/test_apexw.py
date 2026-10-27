@@ -1521,6 +1521,178 @@ class TestPrecisionParity(unittest.TestCase):
             opt.step()
 
 
+class TestStepCountUniformity(unittest.TestCase):
+    """Regression tests for the step-count bug in GPU fast paths.
+
+    The Triton and custom CUDA kernels accept a single step value used for
+    bias correction across all parameters in a group.  When some parameters
+    receive no gradient for several steps their internal step counter lags
+    behind the others.  Using state_steps[0] for every parameter would apply
+    the wrong bias correction to the lagging ones.
+
+    These tests exercise the CPU foreach path (the fast paths only activate on
+    CUDA) but they validate the per-parameter state bookkeeping that the GPU
+    guard is meant to protect.
+    """
+
+    def test_late_param_bias_correction(self):
+        """A param that starts receiving gradients late must use its own step=1
+        bias correction on its first update, not the step count of the params
+        that received gradients from the beginning.
+        """
+        torch.manual_seed(0)
+        # Two independent params so each has its own state entry
+        p_early = torch.tensor([0.5], requires_grad=True)
+        p_late  = torch.tensor([0.5], requires_grad=True)
+
+        opt = ApexW(
+            [{"params": [p_early]}, {"params": [p_late]}],
+            lr=0.1,
+            weight_decay=0.0,
+            precision="full",
+            foreach=False,
+        )
+
+        # Reference: a fresh optimizer with only p_late (always step=1 on first update)
+        p_ref = torch.tensor([0.5], requires_grad=True)
+        opt_ref = ApexW([p_ref], lr=0.1, weight_decay=0.0, precision="full", foreach=False)
+
+        # Steps 1-3: only p_early gets a gradient
+        for _ in range(3):
+            opt.zero_grad()
+            p_early.grad = torch.tensor([1.0])
+            opt.step()
+
+        # Step 4: p_late gets its first gradient — should be treated as step=1
+        opt.zero_grad()
+        p_early.grad = torch.tensor([1.0])
+        p_late.grad = torch.tensor([1.0])
+        opt.step()
+
+        # Reference optimizer updates p_ref for the first time at step=1
+        opt_ref.zero_grad()
+        p_ref.grad = torch.tensor([1.0])
+        opt_ref.step()
+
+        self.assertAlmostEqual(
+            p_late.item(), p_ref.item(), places=5,
+            msg="Late-starting param must use step=1 bias correction on first update",
+        )
+
+    def test_uniform_steps_produce_consistent_updates(self):
+        """When all params share the same step history the foreach and
+        single-tensor paths must agree numerically."""
+        torch.manual_seed(1)
+        results = {}
+        for foreach in (False, True):
+            p = torch.tensor([1.0, -1.0], requires_grad=True)
+            opt = ApexW([p], lr=0.01, weight_decay=0.01, precision="full", foreach=foreach)
+            for step in range(5):
+                opt.zero_grad()
+                p.grad = torch.tensor([0.5, -0.5])
+                opt.step()
+            results[foreach] = p.detach().clone()
+
+        self.assertTrue(
+            torch.allclose(results[False], results[True], atol=1e-6),
+            "foreach and single-tensor paths must agree when step counts are uniform",
+        )
+
+
+class TestApexWZeroCheckpoint(unittest.TestCase):
+    """Regression tests for ApexWZeRO state_dict / load_state_dict (Bug 2).
+
+    ApexWZeRO previously had no checkpoint methods, so resuming training from
+    a mid-run checkpoint would silently restart the optimizer moments from
+    zero, producing different parameter trajectories than uninterrupted runs.
+    """
+
+    def _make_zero_opt(self, params):
+        from apexw.zero import ApexWZeRO
+        return ApexWZeRO(params, lr=0.01, weight_decay=0.01, world_size=1, rank=0)
+
+    def test_checkpoint_round_trip(self):
+        """Resumed training must continue from the saved optimizer state and
+        produce the same parameters as an uninterrupted run of the same length.
+        """
+        try:
+            from apexw.zero import ApexWZeRO
+        except ImportError:
+            self.skipTest("ApexWZeRO not importable")
+
+        torch.manual_seed(42)
+        model_a = nn.Linear(8, 4, bias=False)
+        model_b = nn.Linear(8, 4, bias=False)
+        model_b.load_state_dict(model_a.state_dict())
+
+        # Use full precision so checkpoint/resume has no BF16 quantization noise.
+        # Pre-generate all inputs so both runs see exactly the same batches.
+        inputs = [torch.randn(4, 8) for _ in range(10)]
+
+        opt_ref = ApexWZeRO(
+            model_a.parameters(), lr=0.01, weight_decay=0.01,
+            world_size=1, rank=0, precision="full",
+        )
+        opt_run = ApexWZeRO(
+            model_b.parameters(), lr=0.01, weight_decay=0.01,
+            world_size=1, rank=0, precision="full",
+        )
+
+        # Uninterrupted: 10 steps on opt_ref
+        for x in inputs:
+            opt_ref.zero_grad()
+            model_a(x).sum().backward()
+            opt_ref.step()
+
+        # Interrupted: 5 steps, save checkpoint, reload, 5 more steps
+        for x in inputs[:5]:
+            opt_run.zero_grad()
+            model_b(x).sum().backward()
+            opt_run.step()
+
+        sd = opt_run.state_dict()
+        # Create a fresh optimizer on model_b and restore state
+        opt_resumed = ApexWZeRO(
+            model_b.parameters(), lr=0.01, weight_decay=0.01,
+            world_size=1, rank=0, precision="full",
+        )
+        opt_resumed.load_state_dict(sd)
+
+        # Continue with the same inputs that opt_ref used for steps 6-10
+        for x in inputs[5:]:
+            opt_resumed.zero_grad()
+            model_b(x).sum().backward()
+            opt_resumed.step()
+
+        for pa, pb in zip(model_a.parameters(), model_b.parameters()):
+            self.assertTrue(
+                torch.allclose(pa, pb, atol=1e-5),
+                "Resumed training must match uninterrupted run within tolerance",
+            )
+
+    def test_state_dict_contains_local_opt(self):
+        """state_dict must include the inner optimizer's moment tensors."""
+        try:
+            from apexw.zero import ApexWZeRO
+        except ImportError:
+            self.skipTest("ApexWZeRO not importable")
+
+        torch.manual_seed(0)
+        model = nn.Linear(4, 2, bias=False)
+        opt = ApexWZeRO(model.parameters(), lr=0.01, world_size=1, rank=0)
+
+        model(torch.randn(2, 4)).sum().backward()
+        opt.step()
+
+        sd = opt.state_dict()
+        self.assertIn("local_opt", sd, "state_dict must contain 'local_opt' key")
+        self.assertIn("zero_meta", sd, "state_dict must contain 'zero_meta' key")
+        # The inner optimizer must have populated state (moments/step counters)
+        self.assertTrue(
+            len(sd["local_opt"]["state"]) > 0,
+            "Inner optimizer state must be non-empty after one step",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
-
