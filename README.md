@@ -351,11 +351,43 @@ from apexw import ApexWZeRO
 optimizer = ApexWZeRO(model.parameters(), lr=1e-3, world_size=world_size, rank=rank)
 ```
 
----
-
 ## 🔮 Complete Optimizer Configuration Matrix
 
 When designing or training neural networks you can end up with highly unconventional architectures. Use this matrix to pick the right ApexW settings without trial and error.
+
+> [!NOTE]
+> **New to optimizers? Read this first.**
+> An *optimizer* is the part of training that updates your model's weights after each backward pass. ApexW is a drop-in replacement for `torch.optim.AdamW` with memory and speed improvements built in. The three knobs below control how those improvements are applied — the defaults work well for most models, so only reach for these when you hit a specific bottleneck.
+
+---
+
+### The Three Knobs Explained (Plain English)
+
+| Knob | What it does | When to change it |
+| :--- | :--- | :--- |
+| **`auto_pack`** | Groups your model's many tiny weight tensors into one big contiguous buffer so the GPU runs a *single* kernel instead of hundreds of tiny ones. Think of it like packing 200 small boxes into one shipping pallet — one truck trip vs. 200 trips. | Enable when your model has **lots of small layers** (e.g. a deep MLP, many attention heads). Disable for models with just 1–3 huge layers. |
+| **`pack_threshold`** | The maximum size (in number of elements) a parameter can be and still get packed. Parameters larger than this limit are left alone. | Use when your model mixes giant tensors (like an embedding table with millions of entries) alongside many small ones. Set the threshold just below the giant tensor's size so only the small ones get packed. |
+| **`torch.compile`** | Asks PyTorch's compiler to trace your model and fuse operations into optimized machine code. Removes Python overhead entirely. | Enable for GPU training whenever your input shapes don't change batch-to-batch. Avoid on CPU — compile overhead outweighs the savings. |
+
+---
+
+### Which Architecture Type Are You?
+
+Answer these questions to find your row in the table below:
+
+- **How many layers does your model have?**
+  - Hundreds of small ones → leaning toward #1 (Spindle) or #3 (Chimera)
+  - Just 1–3 but each is massive → #2 (Pillar)
+  - A handful, but each is very wide → #4 (Shallow-Wide)
+- **Do you have a huge embedding table** (vocabulary, positional, etc.)?
+  - Yes, plus many small layers too → #3 (Chimera)
+  - Yes, and that's basically the whole model → #2 (Pillar)
+- **Are you GPU-limited on memory?** → #5 (Edge Device)
+- **Are you training on CPU only?** → #6 (CPU Fallback)
+
+---
+
+### Quick-Reference Table
 
 | # | Architecture | `torch.compile` | `auto_pack` | `pack_threshold` |
 | :---: | :--- | :---: | :---: | :---: |
@@ -372,86 +404,161 @@ When designing or training neural networks you can end up with highly unconventi
 
 #### 1 — The Mega-Deep Spindle *(200+ tiny layers)*
 
+**Real-world examples:** Very deep MLPs, recursive models, NeRF-style networks, hyper-networks with hundreds of small submodules, tiny-attention transformers with many thin blocks.
+
+**What's happening without `auto_pack`:** Each small weight tensor gets its own GPU kernel launch. Launching 200 kernels sequentially for 200 tiny layers takes ~4 ms of pure launch overhead before any actual math runs — that's often *more* time than the math itself.
+
 > [!TIP]
-> **Maximum Speed (up to 47% faster):** `auto_pack` fuses hundreds of sequential tiny operations into larger coalesced kernels, eliminating Python-dispatch latency entirely. Pair with `torch.compile` to strip away remaining Python orchestration overhead.
+> **Maximum Speed (up to 47% faster):** `auto_pack` consolidates those 200 kernel launches into 1. Pair with `torch.compile` to also remove Python loop overhead and you get the fastest possible step time for this architecture type. If you skip `auto_pack` here, you leave speed on the table for free.
 
 ```python
-model = DeepSpindleModel()  # 200+ tiny layers
+model = DeepSpindleModel()   # your 200+ tiny-layer model
 optimizer = ApexW(model.parameters(), lr=1e-3, auto_pack=True)
 compiled_model = torch.compile(model)
+
+# Training loop (unchanged from standard PyTorch)
+for x, y in dataloader:
+    optimizer.zero_grad(set_to_none=True)
+    loss = criterion(compiled_model(x), y)
+    loss.backward()
+    optimizer.step()
 ```
 
 ---
 
 #### 2 — The Monolith Pillar *(1–2 massive layers)*
 
+**Real-world examples:** A standalone language model head (`nn.Linear(4096, 32000)`), a single giant embedding table, a lone huge projection matrix in a state-space model.
+
+**What's happening if you enable `auto_pack` here:** There's nothing to pack (only 1–2 tensors). `auto_pack` would copy a 500 MB embedding into a temporary buffer, do the exact same math, then copy it back — burning extra VRAM for zero gain.
+
 > [!TIP]
-> **Fastest speed + maximum memory savings:** With only one or two large kernels, launch overhead is negligible. Packing giant tensors dynamically wastes VRAM — keep `auto_pack=False`.
+> **Fastest speed + maximum memory savings:** With only one or two large kernels, GPU launch overhead is already negligible — one launch is one launch. Keep `auto_pack=False` and let `torch.compile` fuse the forward + backward + optimizer step into one optimized graph.
 
 ```python
-model = MonolithModel()  # e.g. a single 4096×32000 LM head
+model = MonolithModel()   # e.g. a single nn.Linear(4096, 32000) LM head
 optimizer = ApexW(model.parameters(), lr=1e-3, auto_pack=False)
 compiled_model = torch.compile(model)
+
+for x, y in dataloader:
+    optimizer.zero_grad(set_to_none=True)
+    loss = criterion(compiled_model(x), y)
+    loss.backward()
+    optimizer.step()
 ```
 
 ---
 
 #### 3 — The Hybrid Chimera *(huge embedding + many tiny blocks)*
 
+**Real-world examples:** A transformer with a large vocabulary embedding (`nn.Embedding(50000, 512)`) *plus* 24 small attention/FFN blocks, a multi-modal model with a giant visual encoder and a small text decoder.
+
+**The problem:** If you enable `auto_pack` without a threshold, it tries to pack *everything* — including the 50 M-element embedding table. That wastes VRAM. If you disable it entirely, the 24 tiny blocks lose their speed benefit.
+
 > [!TIP]
-> **Optimal balance:** Set `pack_threshold` below the embedding's element count so `auto_pack` only fuses the small blocks, leaving the large embedding tensor untouched and saving VRAM.
+> **Optimal balance:** Set `pack_threshold` to a value *smaller* than the embedding's element count but *larger* than any small block's element count. This way `auto_pack` only sees and fuses the small layers, leaving the giant embedding completely untouched.
 
 ```python
-# Embedding has 50 M elements — threshold keeps it out of the pack buffer
+# How to find a good threshold:
+#   print(max(p.numel() for p in model.small_blocks.parameters()))  # e.g. 12 288
+#   print(min(p.numel() for p in model.embedding.parameters()))     # e.g. 25 600 000
+# → any value between 12 288 and 25 600 000 works; 50 000 is a safe conservative pick
+
 optimizer = ApexW(
     model.parameters(),
     lr=1e-3,
     auto_pack=True,
-    pack_threshold=50_000,   # only pack params with numel < 50 K
+    pack_threshold=50_000,   # params with numel < 50 K get packed; embedding stays free
 )
 compiled_model = torch.compile(model)
+
+for x, y in dataloader:
+    optimizer.zero_grad(set_to_none=True)
+    loss = criterion(compiled_model(x), y)
+    loss.backward()
+    optimizer.step()
 ```
 
 ---
 
 #### 4 — The Extreme Shallow-Wide *(few layers, massive parallel paths)*
 
+**Real-world examples:** A 2-layer MLP where each layer is `nn.Linear(8192, 8192)`, a wide ResNet block, a single multi-head attention layer with 128 heads operating in parallel.
+
+**Why packing doesn't help here:** Wide layers are already parallelised across thousands of GPU cores in a single kernel — the GPU is already working at maximum capacity per layer. Packing a 67 M-element tensor would require a large temporary copy and still run the same number of kernels.
+
 > [!NOTE]
-> **Low overhead mode:** Wide layers naturally execute in parallel — no packing benefit. The overhead of managing pack memory segments would outweigh any minor launch savings here.
+> **Low overhead mode:** The bottleneck here is raw compute, not kernel-launch overhead. Focus tuning effort on batch size, mixed precision, and learning-rate schedule rather than optimizer knobs. `torch.compile` is worth trying — measure with and without for your exact shape.
 
 ```python
-model = ShallowWideModel()
+model = ShallowWideModel()   # e.g. nn.Sequential(nn.Linear(8192, 8192), nn.Linear(8192, 8192))
 optimizer = ApexW(model.parameters(), lr=1e-3, auto_pack=False)
-# torch.compile optional — test with and without for your specific shape
+# Try both — torch.compile helps here when shapes are static
+compiled_model = torch.compile(model)
+
+for x, y in dataloader:
+    optimizer.zero_grad(set_to_none=True)
+    loss = criterion(compiled_model(x), y)
+    loss.backward()
+    optimizer.step()
 ```
 
 ---
 
-#### 5 — The Memory-Starved Edge Device *(limited VRAM)*
+#### 5 — The Memory-Starved Edge Device *(limited VRAM, e.g. ≤ 8 GB GPU)*
+
+**Real-world examples:** Training on an RTX 3060 (8 GB), a Jetson AGX, a colab free-tier T4 with a large model, or any setup where you're already hitting CUDA out-of-memory errors.
+
+**Why `auto_pack` makes things worse here:** `auto_pack` creates a temporary flat buffer to hold the packed tensors. On a memory-starved device that temporary allocation can be the straw that breaks the camel's back and triggers an OOM. Turning it off removes that overhead entirely.
 
 > [!IMPORTANT]
-> **Peak VRAM reduction (~20% additional savings):** `torch.compile` reuses intermediate activation buffers aggressively. Disable `auto_pack` to prevent temporary indexing overhead from adding pressure on an already-tight memory budget.
+> **Peak VRAM reduction (~20% additional savings on top of ApexW's baseline 50%):** `torch.compile` with `precision="compact"` is the winning combo — the compiler aggressively reuses intermediate activation buffers, and compact bf16 states cut optimizer memory in half. No packing needed.
 
 ```python
 model = LightweightModel().to("cuda")
-optimizer = ApexW(model.parameters(), lr=1e-3, auto_pack=False, precision="compact")
+
+# precision="compact" → optimizer states in bf16 (50% VRAM savings vs AdamW)
+# auto_pack=False     → no temporary pack buffer allocation
+optimizer = ApexW(model.parameters(), lr=1e-3, precision="compact", auto_pack=False)
 compiled_model = torch.compile(model)
+
+for x, y in dataloader:
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast("cuda", dtype=torch.bfloat16):   # also activations in bf16
+        loss = criterion(compiled_model(x), y)
+    loss.backward()
+    optimizer.step()
 ```
 
 ---
 
-#### 6 — The CPU Fallback *(no GPU)*
+#### 6 — The CPU Fallback *(no GPU available)*
+
+**Real-world examples:** Running on a laptop without discrete GPU, a GitHub Actions CI runner, a Raspberry Pi, or any environment where `torch.cuda.is_available()` returns `False`.
+
+**Why `auto_pack` and `torch.compile` don't help on CPU:**
+- `auto_pack` is designed around GPU memory alignment and coalesced kernel launches — concepts that don't map to CPU execution. On CPU it just adds Python overhead with no upside.
+- `torch.compile` (Dynamo) on CPU introduces compilation latency upfront and for small models the compiled version is often *slower* than eager due to graph dispatch overhead.
 
 > [!NOTE]
-> **Eager mode, no packing:** `auto_pack` relies on dynamic memory alignment optimised for GPU parallelism. On CPU, PyTorch's eager foreach path is already optimal — keep both options off.
+> **Eager mode is optimal on CPU:** PyTorch's foreach path (which ApexW uses automatically on CPU) is already the fastest option — it batches operations into vectorized ATen C++ calls without any overhead. Just use the default settings and let ApexW detect the CPU backend automatically.
 
 ```python
 model = AnyModel().to("cpu")
-optimizer = ApexW(model.parameters(), lr=1e-3, auto_pack=False)
-# Do NOT call torch.compile here — Dynamo overhead dominates on CPU for small models
+
+# ApexW auto-detects CPU and switches to the foreach path — no config needed
+optimizer = ApexW(model.parameters(), lr=1e-3)
+# ❌ Do NOT do: torch.compile(model) — adds overhead, rarely helps on CPU
+
+for x, y in dataloader:
+    optimizer.zero_grad(set_to_none=True)
+    loss = criterion(model(x), y)
+    loss.backward()
+    optimizer.step()
 ```
 
 ---
+
 
 ## Repository Structure
 
