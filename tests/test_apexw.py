@@ -57,7 +57,7 @@ class TestApexW(unittest.TestCase):
             for p in model.parameters()
         )
 
-        opt_apex = ApexW(model.parameters(), lr=1e-3, precision="compact")
+        opt_apex = ApexW(model.parameters(), lr=1e-3, precision="compact", betas=(0.9, 0.95))
         opt_apex.step()
         apex_bytes = sum(
             sum(v.nelement() * v.element_size() for v in opt_apex.state[p].values() if torch.is_tensor(v) and v.ndim >= 1)
@@ -65,7 +65,7 @@ class TestApexW(unittest.TestCase):
         )
 
         print(f"\nState Buffer Bytes: AdamW={adamw_bytes}, ApexW={apex_bytes}")
-        # Compact ApexW uses exactly 50% bytes
+        # Compact ApexW with beta2<0.995 uses exactly 50% bytes (both m and v in bf16)
         self.assertEqual(apex_bytes, adamw_bytes // 2)
 
     def test_state_dict_save_and_load(self):
@@ -350,7 +350,8 @@ class TestApexW(unittest.TestCase):
     def test_memory_summary(self):
         """Test the memory summary formatting."""
         model = nn.Linear(256, 128, bias=False)
-        opt = ApexW(model.parameters(), lr=1e-3, precision="compact")
+        # Use beta2=0.95 (LLM recipe) so both m and v stay in bf16 -> 50% savings
+        opt = ApexW(model.parameters(), lr=1e-3, precision="compact", betas=(0.9, 0.95))
         model(torch.randn(1, 256)).sum().backward()
         opt.step()
 
@@ -567,23 +568,48 @@ class TestApexW(unittest.TestCase):
         self.assertTrue(opt.defaults["decay_norm_only"])
 
     def test_smart_threshold_partitioning(self):
-        """Verify smart partitioning: 2D+ weights get compact BF16, 1D norm/bias get FP32."""
+        """Verify smart partitioning: 2D+ weights get compact BF16 for m, 1D norm/bias get FP32.
+        With default beta2=0.999, exp_avg_sq (v) is auto-escalated to fp32 for all compact params.
+        With beta2=0.95, exp_avg_sq stays in bfloat16 (safe margin = 6.4x).
+        """
         linear = nn.Linear(256, 256)
         norm = nn.LayerNorm(256)
-        opt = ApexW(list(linear.parameters()) + list(norm.parameters()), precision="auto", threshold=65536)
 
+        # Case 1: beta2=0.95 (safe) -> both m and v in bfloat16 for massive params
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            opt95 = ApexW(
+                list(linear.parameters()) + list(norm.parameters()),
+                precision="auto", threshold=65536, betas=(0.9, 0.95),
+            )
         for p in list(linear.parameters()) + list(norm.parameters()):
             p.grad = torch.randn_like(p)
-        opt.step()
+        opt95.step()
 
-        # 2D Linear weight should be bfloat16
-        self.assertEqual(opt.state[linear.weight]["exp_avg"].dtype, torch.bfloat16)
-        self.assertEqual(opt.state[linear.weight]["exp_avg_sq"].dtype, torch.bfloat16)
+        # 2D Linear weight: m=bf16, v=bf16 (beta2=0.95, margin=6.4x)
+        self.assertEqual(opt95.state[linear.weight]["exp_avg"].dtype, torch.bfloat16)
+        self.assertEqual(opt95.state[linear.weight]["exp_avg_sq"].dtype, torch.bfloat16)
 
-        # 1D Linear bias and LayerNorm params (< threshold) should be float32
-        self.assertEqual(opt.state[linear.bias]["exp_avg"].dtype, torch.float32)
-        self.assertEqual(opt.state[norm.weight]["exp_avg"].dtype, torch.float32)
-        self.assertEqual(opt.state[norm.bias]["exp_avg"].dtype, torch.float32)
+        # 1D params (< threshold): m=fp32, v=fp32 (auto=full for small 1D)
+        self.assertEqual(opt95.state[linear.bias]["exp_avg"].dtype, torch.float32)
+        self.assertEqual(opt95.state[norm.weight]["exp_avg"].dtype, torch.float32)
+        self.assertEqual(opt95.state[norm.bias]["exp_avg"].dtype, torch.float32)
+
+        # Case 2: beta2=0.999 (severe) -> m=bf16, v=fp32 for massive params
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            opt999 = ApexW(
+                list(linear.parameters()) + list(norm.parameters()),
+                precision="auto", threshold=65536, betas=(0.9, 0.999),
+            )
+        for p in list(linear.parameters()) + list(norm.parameters()):
+            p.grad = torch.randn_like(p)
+        opt999.step()
+
+        # 2D Linear weight: m=bf16 (compact), v=fp32 (auto-escalated for correctness)
+        self.assertEqual(opt999.state[linear.weight]["exp_avg"].dtype, torch.bfloat16)
+        self.assertEqual(opt999.state[linear.weight]["exp_avg_sq"].dtype, torch.float32)
 
     def test_cuda_extension_safe_fallback(self):
         """Verify CUDA extension interface is safely present and returns graceful fallback."""
@@ -680,20 +706,39 @@ class TestApexW(unittest.TestCase):
         self.assertGreater(z0_mem, 0.0)
 
     def test_master_weight_copy_isolation(self):
-        """Verify master weights are maintained strictly in float32 without downcasting."""
+        """Verify master weights are maintained strictly in float32 without downcasting.
+        Uses beta2=0.95 (safe compact range) so both m and v stay in bfloat16.
+        Verifies that at beta2=0.999, exp_avg_sq auto-escalates to fp32 while param stays fp32.
+        """
         linear = nn.Linear(32, 16)
         self.assertEqual(linear.weight.dtype, torch.float32)
 
-        opt = ApexW(linear.parameters(), lr=1e-3, precision="auto")
+        # beta2=0.95: m=bf16, v=bf16 (safe 6.4x margin)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            opt = ApexW(linear.parameters(), lr=1e-3, precision="auto", betas=(0.9, 0.95))
         linear(torch.randn(4, 32)).sum().backward()
         opt.step()
 
         # Parameter must remain full float32
         self.assertEqual(linear.weight.dtype, torch.float32)
-        # History state must be compact bfloat16
+        # History state: m=compact bfloat16, v=compact bfloat16 (beta2=0.95 safe)
         state = opt.state[linear.weight]
         self.assertEqual(state["exp_avg"].dtype, torch.bfloat16)
         self.assertEqual(state["exp_avg_sq"].dtype, torch.bfloat16)
+
+        # beta2=0.999: v auto-escalates to fp32, parameter stays fp32
+        linear2 = nn.Linear(32, 16)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            opt2 = ApexW(linear2.parameters(), lr=1e-3, precision="auto", betas=(0.9, 0.999))
+        linear2(torch.randn(4, 32)).sum().backward()
+        opt2.step()
+        self.assertEqual(linear2.weight.dtype, torch.float32)
+        state2 = opt2.state[linear2.weight]
+        self.assertEqual(state2["exp_avg"].dtype, torch.bfloat16)      # m stays compact
+        self.assertEqual(state2["exp_avg_sq"].dtype, torch.float32)    # v auto-escalated
 
     def test_adaptive_dynamic_epsilon(self):
         """Verify adaptive dynamic epsilon prevents division by zero with zero/tiny gradients."""
@@ -2316,7 +2361,79 @@ class TestParameterFlattening(unittest.TestCase):
         self.assertEqual(opt.state[p1]["step"].item(), 1.0)
         self.assertEqual(opt.state[p2]["step"].item(), 1.0)
 
+    def test_beta2_high_v_dtype_escalation(self):
+        """Regression: at beta2>=0.995 exp_avg_sq must be fp32, at beta2<0.995 it follows compact dtype.
+
+        The bf16 steady-state EMA margin is (1 - beta2) * 128 mantissa levels.
+        At beta2=0.999 this is 0.13x - the per-step update (1-beta2)*g^2 is lost in rounding,
+        causing v_t to stagnate. ApexW escalates exp_avg_sq to fp32 in this regime.
+        At beta2=0.95 the margin is 6.4x - compact precision is safe.
+        """
+        import warnings
+        from apexw import ApexW
+        from apexw.optimizer import _BETA2_WARN_THRESHOLD, _BETA2_V_FP32_THRESHOLD
+
+        # Thresholds must be sensible
+        self.assertGreater(_BETA2_V_FP32_THRESHOLD, _BETA2_WARN_THRESHOLD - 0.01)
+        self.assertLessEqual(_BETA2_V_FP32_THRESHOLD, 0.999)
+
+        param = nn.Parameter(torch.randn(64, 64))
+
+        # --- beta2=0.95: safe, v stays in bf16 ---
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            opt_safe = ApexW([param], lr=1e-3, precision="compact", betas=(0.9, 0.95))
+        param.grad = torch.randn_like(param)
+        opt_safe.step()
+        self.assertEqual(opt_safe.state[param]["exp_avg"].dtype, torch.bfloat16,
+                         "m must be compact bfloat16 at beta2=0.95")
+        self.assertEqual(opt_safe.state[param]["exp_avg_sq"].dtype, torch.bfloat16,
+                         "v must be compact bfloat16 at beta2=0.95 (safe margin=6.4x)")
+
+        # --- beta2=0.999: severe, v escalates to fp32, m stays bf16 ---
+        param2 = nn.Parameter(torch.randn(64, 64))
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always", UserWarning)
+            opt_severe = ApexW([param2], lr=1e-3, precision="compact", betas=(0.9, 0.999))
+            # Warning must be issued at construction time
+            self.assertTrue(any("beta2=0.999" in str(ww.message) for ww in w),
+                            "Must warn about beta2=0.999 + compact precision")
+
+        param2.grad = torch.randn_like(param2)
+        opt_severe.step()
+        self.assertEqual(opt_severe.state[param2]["exp_avg"].dtype, torch.bfloat16,
+                         "m must stay compact bfloat16 even at beta2=0.999")
+        self.assertEqual(opt_severe.state[param2]["exp_avg_sq"].dtype, torch.float32,
+                         "v must auto-escalate to fp32 at beta2=0.999 (margin=0.13x)")
+
+        # --- precision='full': no escalation needed, both always fp32 ---
+        param3 = nn.Parameter(torch.randn(64, 64))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            opt_full = ApexW([param3], lr=1e-3, precision="full", betas=(0.9, 0.999))
+        param3.grad = torch.randn_like(param3)
+        opt_full.step()
+        self.assertEqual(opt_full.state[param3]["exp_avg"].dtype, torch.float32)
+        self.assertEqual(opt_full.state[param3]["exp_avg_sq"].dtype, torch.float32)
+
+        # --- Numerical correctness: v at beta2=0.999+fp32 must not stagnate ---
+        # Run 200 steps and verify v_t is still tracking the gradient
+        param4 = nn.Parameter(torch.randn(32))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            opt_num = ApexW([param4], lr=1e-3, precision="compact", betas=(0.9, 0.999),
+                            dynamic_scaling=False)
+        g_sq_true = None
+        for step in range(200):
+            param4.grad = torch.ones(32) * 0.1
+            opt_num.step()
+        v_stored = opt_num.state[param4]["exp_avg_sq"]
+        # At step 200 with beta2=0.999, v = (1 - 0.999^200) * 0.01 ≈ 0.00181.
+        # fp32 storage must track this without stagnation.
+        expected_v = (1.0 - 0.999**200) * 0.01
+        self.assertAlmostEqual(v_stored.mean().item(), expected_v, delta=expected_v * 0.05,
+                               msg="v must track gradient at beta2=0.999 with fp32 escalation")
+
 
 if __name__ == "__main__":
     unittest.main()
-
