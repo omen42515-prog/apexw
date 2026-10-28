@@ -778,20 +778,35 @@ class ApexW(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        # Synchronize individual parameter gradients into flat gradient buffers for auto-packed groups
+        # Synchronize individual parameter gradients into flat gradient buffers for auto-packed groups.
+        # Fix 2: A packed group with SOME gradients present and others absent cannot be handled
+        # correctly by substituting zeros — a zero gradient silently updates momentum and applies
+        # weight decay for a parameter that should be completely skipped this step.
+        # Raise a clear error rather than producing silently wrong training semantics.
         if getattr(self, "auto_pack", False):
             for packed in self.packed_param_groups:
                 flat_param = packed["flat_param"]
                 individual_params = packed["individual_params"]
                 is_1d = packed["is_1d"]
 
-                if any(p.grad is not None for p in individual_params):
-                    grads = []
-                    for p in individual_params:
-                        if p.grad is not None:
-                            grads.append(p.grad.detach().contiguous().view(-1))
-                        else:
-                            grads.append(torch.zeros(p.numel(), dtype=p.dtype, device=p.device))
+                grad_present = [p.grad is not None for p in individual_params]
+                if any(grad_present):
+                    if not all(grad_present):
+                        missing = [
+                            i for i, present in enumerate(grad_present) if not present
+                        ]
+                        raise RuntimeError(
+                            f"ApexW auto_pack: packed group has {len(missing)} parameter(s) "
+                            f"with grad=None (indices {missing}) while other parameters in the "
+                            f"same packed buffer have gradients. Substituting zero gradients "
+                            f"would silently apply momentum decay and weight decay to those "
+                            f"parameters, corrupting training. "
+                            f"Fix: set auto_pack=False, or ensure all parameters in a packed "
+                            f"group always produce gradients together (e.g. use the same "
+                            f"requires_grad mask, or exclude sparse/conditionally-used params "
+                            f"with pack_threshold=0 for those parameter groups)."
+                        )
+                    grads = [p.grad.detach().contiguous().view(-1) for p in individual_params]
                     cat_grad = torch.cat(grads)
                     flat_param.grad = cat_grad if is_1d else cat_grad.unsqueeze(-1)
                 else:
@@ -923,12 +938,33 @@ class ApexW(Optimizer):
             if backend_grad_scale is not None and not is_capturing and not compiling:
                 inv_scale = float(backend_grad_scale.reciprocal().item())
 
+            # Fix 1 — Mixed-dtype guard: the Triton kernel loads both m and v as float32 via
+            # tl.load().to(tl.float32), then stores back into the *same* buffer dtype for both.
+            # When ApexW splits dtypes (m in BF16, v in FP32 for high beta2), the Triton kernel
+            # would store the updated v back through the m-buffer dtype pointer, corrupting v.
+            # Guard: only allow Triton when all (m_dtype == v_dtype) pairs are uniform.
+            #
+            # Fix 3 — Dynamic-scaling guard: the Triton kernel reads scale_v from optimizer state
+            # but never initializes it or runs recalibration in its own code path. Routing a config
+            # that needs scaling through Triton silently bypasses the recalibration logic.
+            # Guard: only allow Triton when dynamic_scaling is off OR all v states are fp32
+            # (fp32 states don't need scaling — the guard reduces to the mixed-dtype check above).
+            _states_have_mixed_moment_dtypes = any(
+                self.state[p].get("state_dtype_v", self.state[p].get("state_dtype", p.dtype))
+                != self.state[p].get("state_dtype", p.dtype)
+                for p in params_with_grad
+                if p in self.state
+            )
+            _dynamic_scaling_active = group.get("dynamic_scaling", True) and any(
+                exp_avg_sqs[i].dtype in (torch.bfloat16, torch.float16)
+                for i in range(len(exp_avg_sqs))
+            )
+
             # -------------------------------------------------------------
             # PATH 2: OpenAI Triton Fused GPU Kernel (NVIDIA CUDA & AMD ROCm)
             # -------------------------------------------------------------
-            # Automatically compiles down to highly efficient machine code
-            # for both NVIDIA GPUs (PTX/SASS) and AMD GPUs (ROCm / HIP).
-            # Fuses AMP gradient unscaling directly in registers (zero auxiliary VRAM allocation).
+            # Iterates over parameters and invokes the single-parameter Triton launcher for each.
+            # Fuses AMP gradient unscaling in-kernel (zero auxiliary VRAM allocation).
             can_use_triton = (
                 (backend == "triton" or (backend in (None, "auto") and is_triton_available()))
                 and is_cuda
@@ -940,6 +976,10 @@ class ApexW(Optimizer):
                 and not capturable
                 and not compiling
                 and not maximize
+                # Fix 1: both moment buffers must share the same dtype for the Triton kernel
+                and not _states_have_mixed_moment_dtypes
+                # Fix 3: dynamic scaling recalibration only runs in the fallback path
+                and not _dynamic_scaling_active
             )
             # Only evaluate steps_are_uniform when Triton or custom CUDA is viable.
             # Avoid calling _get_value (Tensor.item()) under torch.compile to prevent Dynamo graph breaks.
@@ -957,6 +997,11 @@ class ApexW(Optimizer):
                 and not maximize
                 and backend_grad_scale is None
                 and found_inf is None
+                # Fix 1: the CUDA kernel uses a single state_dtype_code for both m and v;
+                # mismatched dtypes would pass the wrong dtype code for v, corrupting it.
+                and not _states_have_mixed_moment_dtypes
+                # Fix 3: dynamic scaling recalibration only runs in the fallback path
+                and not _dynamic_scaling_active
                 and is_cuda_kernel_available()
             )
             if can_use_triton or can_use_cuda_fused:
@@ -967,12 +1012,8 @@ class ApexW(Optimizer):
             if can_use_triton and steps_are_uniform:
                 step_val = int(_get_value(state_steps[0])) + 1
                 torch._foreach_add_(state_steps, 1)
-                scales_v = {}
-                if group.get("dynamic_scaling", True):
-                    for p in params_with_grad:
-                        if "scale_v" in self.state[p]:
-                            scales_v[id(p)] = self.state[p]["scale_v"]
-
+                # scale_v is not passed here: dynamic_scaling_active=False guarantees all v states
+                # are fp32 or dynamic scaling is disabled — scale_v=1.0 is the correct default.
                 success = triton_multi_tensor_adamw_step(
                     params_with_grad,
                     grads,
@@ -985,13 +1026,14 @@ class ApexW(Optimizer):
                     weight_decay=wd,
                     step=step_val,
                     decay_norm_only=decay_norm_only,
-                    scales_v=scales_v if scales_v else None,
+                    scales_v=None,  # Fix 3: scale_v only valid after fallback initialization
                     inv_scale=inv_scale,
                 )
                 if success:
                     continue
                 # If Triton execution did not succeed, roll back step counter for fallback
                 torch._foreach_sub_(state_steps, 1)
+
 
             # -------------------------------------------------------------
             # PATH 3: Custom C++/CUDA 128-bit Vectorized Fused Kernel
