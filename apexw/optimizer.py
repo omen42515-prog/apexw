@@ -301,8 +301,14 @@ class ApexW(Optimizer):
         lr (float, optional): Learning rate (default: 1e-3).
         betas (Tuple[float, float] or Tuple[float, float, float], optional):
             Coefficients used for computing running averages of gradient and its
-            square (default: (0.9, 0.999)). If a 3-tuple is provided, the 3rd element
-            is used as ``beta3`` for AdEMAMix.
+            square (default: (0.9, 0.95)). The default ``beta2=0.95`` is tuned for
+            maximum compact-precision safety — it delivers a 6.4× bf16 EMA headroom
+            versus the AdamW default of 0.999 (0.1× headroom), completely
+            eliminating second-moment stagnation under 16-bit states while
+            matching modern LLM training recipes. For exact AdamW compatibility
+            use betas=(0.9, 0.999) with precision='full'.
+            If a 3-tuple is provided, the 3rd element is used as ``beta3``
+            for AdEMAMix.
         eps (float, optional): Term added to the denominator to improve numerical
             stability (default: 1e-8).
         weight_decay (float, optional): Decoupled weight decay coefficient (default: 1e-2).
@@ -353,7 +359,7 @@ class ApexW(Optimizer):
         self,
         params,
         lr: float = 1e-3,
-        betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.999),
+        betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.95),
         eps: float = 1e-8,
         weight_decay: float = 1e-2,
         amsgrad: bool = False,
@@ -413,11 +419,12 @@ class ApexW(Optimizer):
             if _beta2_val >= _BETA2_V_FP32_THRESHOLD:
                 # Severe: auto-escalate v to fp32 (handled in _init_group)
                 warnings.warn(
-                    f"ApexW: beta2={_beta2_val} with precision='{precision}' activates "
-                    f"severe bf16 second-moment stagnation (bf16 margin ≈ {_margin:.2f}×). "
-                    f"exp_avg_sq (v) will be automatically stored in float32 to preserve "
-                    f"numerical correctness, saving 25% vs AdamW instead of 50%. "
-                    f"To suppress: use precision='full' or set beta2 < {_BETA2_V_FP32_THRESHOLD}.",
+                    f"ApexW: beta2={_beta2_val} with precision='{precision}' causes severe "
+                    f"bf16 second-moment stagnation (bf16 margin ≈ {_margin:.2f}×). "
+                    f"exp_avg_sq (v) is automatically stored in float32 to preserve "
+                    f"numerical correctness (25% VRAM savings instead of 50%). "
+                    f"Quick fix: use betas=(0.9, 0.95) for maximum speed + 50% VRAM savings. "
+                    f"Or use precision='full' to silence this with all-fp32 states.",
                     UserWarning,
                     stacklevel=2,
                 )
@@ -425,9 +432,10 @@ class ApexW(Optimizer):
                 # Mild (0.99 ≤ beta2 < 0.995): warn but don't escalate automatically
                 warnings.warn(
                     f"ApexW: beta2={_beta2_val} with precision='{precision}' may cause mild "
-                    f"bf16 second-moment precision loss (bf16 margin ≈ {_margin:.2f}×). "
-                    f"Consider beta2 < 0.99 or precision='full' for long training runs. "
-                    f"Dynamic range scaling will partially compensate.",
+                    f"bf16 second-moment precision loss (bf16 margin ≈ {_margin:.2f}×) "
+                    f"on long training runs. "
+                    f"Quick fix: use betas=(0.9, 0.95) for zero warnings + maximum performance. "
+                    f"Dynamic range scaling will partially compensate at this setting.",
                     UserWarning,
                     stacklevel=2,
                 )
