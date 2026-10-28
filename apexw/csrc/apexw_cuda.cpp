@@ -111,8 +111,22 @@ void apexw_cuda_step_fused(
         TORCH_CHECK(param_code != -1, "ApexW CUDA supports Float32, BFloat16, and Float16 parameters");
         TORCH_CHECK(state_code != -1, "ApexW CUDA supports Float32, BFloat16, and Float16 optimizer states");
 
+        // Fix 1: The kernel uses a single state_dtype_code for both exp_avg and exp_avg_sq.
+        // When ApexW splits moment dtypes (e.g. m in BF16, v in FP32 for high beta2), passing
+        // the m-derived state_code for v would cause the kernel to interpret v's memory as the
+        // wrong type, corrupting the variance state. Reject the call and let Python route it
+        // to the fallback (_single_tensor_step / _multi_tensor_step) which handles split dtypes.
+        TORCH_CHECK(m.scalar_type() == v.scalar_type(),
+                    "ApexW CUDA kernel requires exp_avg and exp_avg_sq to share the same dtype. "
+                    "Got exp_avg=" + std::string(at::toString(m.scalar_type())) +
+                    " and exp_avg_sq=" + std::string(at::toString(v.scalar_type())) + ". "
+                    "This configuration (mixed moment dtypes) must use the CPU/foreach fallback. "
+                    "The Python dispatch guard should have prevented reaching this point; "
+                    "set APEXW_DEBUG=1 to trace the dispatch path.");
+
         int key = (param_code << 4) | state_code;
         dtype_groups[key].push_back(i);
+
     }
 
     for (const auto& kv : dtype_groups) {
