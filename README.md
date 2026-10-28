@@ -52,84 +52,6 @@ for data, target in dataloader:
 optimizer.print_summary()
 ```
 
-#### ⚡ Recommended: AMP (Automatic Mixed Precision) Training
-
-> [!TIP]
-> **This is where ApexW really pulls ahead.** Under AMP, ApexW consistently outperforms both standard and fused `torch.optim.AdamW` — bf16 activations, compact bf16 optimizer states, and in-kernel AMP gradient unscaling all compound at once. On the Triton path, ApexW launches one fused per-parameter Triton kernel (not a single kernel across all parameters), keeping launch overhead low while gradient unscaling is fused directly into the update — no auxiliary VRAM allocation needed. If you're on a CUDA GPU, always prefer one of these loops over plain float32.
-
-**Not sure which path to take? Run this first:**
-
-```python
-# Paste this in a Python shell or notebook cell — tells you exactly which loop to use
-import torch
-cap = torch.cuda.get_device_capability()
-print("RTX 30xx / A100 / H100 or newer → use Path A (simple)" if cap >= (8, 0)
-      else "RTX 20xx / V100 or older      → use Path B (GradScaler)")
-```
-
----
-
-**Path A — Modern GPU (Ampere+: A100, RTX 30xx, H100, L40s, …)**
-
-*bfloat16 has the same dynamic range as float32, so overflow essentially never happens. No `GradScaler` needed — just two extra lines.*
-
-```python
-import torch
-import torch.nn as nn
-from apexw import ApexW
-
-device = "cuda"
-model = nn.Sequential(nn.Linear(256, 512), nn.ReLU(), nn.Linear(512, 10)).to(device)
-optimizer = ApexW(model.parameters(), lr=1e-3, weight_decay=1e-2)
-
-for data, target in dataloader:
-    data, target = data.to(device), target.to(device)
-    optimizer.zero_grad(set_to_none=True)
-
-    with torch.amp.autocast("cuda", dtype=torch.bfloat16):  # ← only change vs basic loop
-        loss = criterion(model(data), target)
-
-    loss.backward()        # no scaler needed — bfloat16 won't underflow
-    optimizer.step()
-
-optimizer.print_summary()
-```
-
----
-
-**Path B — Older GPU (Turing/Volta: RTX 20xx, V100, T4, …)**
-
-*float16 has a narrow dynamic range, so gradients can silently become zero (underflow). `GradScaler` detects and corrects this automatically.*
-
-```python
-import torch
-import torch.nn as nn
-from apexw import ApexW
-
-device = "cuda"
-model = nn.Sequential(nn.Linear(256, 512), nn.ReLU(), nn.Linear(512, 10)).to(device)
-optimizer = ApexW(model.parameters(), lr=1e-3, weight_decay=1e-2)
-
-scaler = torch.amp.GradScaler("cuda")  # guards against float16 gradient underflow
-
-for data, target in dataloader:
-    data, target = data.to(device), target.to(device)
-    optimizer.zero_grad(set_to_none=True)
-
-    with torch.amp.autocast("cuda", dtype=torch.float16):
-        loss = criterion(model(data), target)
-
-    scaler.scale(loss).backward()  # inflates loss so tiny gradients survive float16
-    scaler.step(optimizer)         # deflates gradients back, then calls optimizer.step()
-    scaler.update()                # tunes the scale factor for the next step
-
-optimizer.print_summary()
-```
-
-> [!NOTE]
-> **Why `set_to_none=True`?** The default `zero_grad()` fills gradient buffers with zeros (wastes memory bandwidth). `set_to_none=True` deallocates them entirely and PyTorch recreates them fresh each step — a free ~5–10% speedup under AMP.
-
-
 ### 4. Diagnostics & Verification Runner
 
 ApexW includes a built-in diagnostic runner to verify your environment, report the active backend, test convergence, and display state memory savings:
@@ -439,7 +361,7 @@ When designing or training neural networks you can end up with highly unconventi
 
 ---
 
-### The Three Knobs Explained (Plain English)
+### The Three Knobs Explained 
 
 | Knob | What it does | When to change it |
 | :--- | :--- | :--- |
