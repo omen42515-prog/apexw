@@ -99,6 +99,18 @@ if _HAS_TRITON:
         tl.store(v_ptr + offsets, v, mask=mask)
 
 
+def _next_power_of_2(n: int) -> int:
+    """Return smallest power of 2 >= n."""
+    if n <= 0:
+        return 1
+    if _HAS_TRITON and hasattr(triton, "next_power_of_2"):
+        try:
+            return triton.next_power_of_2(n)
+        except Exception:
+            pass
+    return 1 << (n - 1).bit_length()
+
+
 def triton_adamw_step(
     param: torch.Tensor,
     grad: torch.Tensor,
@@ -115,7 +127,7 @@ def triton_adamw_step(
     sqrt_scale_v: float = 1.0,
     inv_scale: float = 1.0,
     apply_wd: bool = True,
-    block_size: int = 1024,
+    block_size: Optional[int] = None,
 ) -> bool:
     """Executes the Triton fused AdamW kernel on a single tensor."""
     if not is_triton_available():
@@ -124,6 +136,9 @@ def triton_adamw_step(
     n_elements = param.numel()
     if n_elements == 0:
         return True
+
+    if block_size is None:
+        block_size = min(max(64, _next_power_of_2(n_elements)), 1024)
 
     # Ensure tensors are contiguous
     if not param.is_contiguous():
@@ -178,6 +193,7 @@ def triton_multi_tensor_adamw_step(
     decay_norm_only: bool = True,
     scales_v: Optional[Dict[int, float]] = None,
     inv_scale: float = 1.0,
+    block_size: Optional[int] = None,
 ) -> bool:
     """
     Executes the Triton fused AdamW kernel across multiple tensors.
@@ -226,6 +242,7 @@ def triton_multi_tensor_adamw_step(
             sqrt_scale_v=sqrt_scale_v,
             inv_scale=inv_scale,
             apply_wd=apply_wd,
+            block_size=block_size,
         )
         if not success:
             return False
