@@ -90,6 +90,7 @@ While ApexW follows PyTorch optimizer conventions, its default settings are tune
 
 | Setting | ApexW Default | PyTorch AdamW Default | Why it matters | How to match standard AdamW |
 | :--- | :--- | :--- | :--- | :--- |
+| **`betas`** | `(0.9, 0.95)` | `(0.9, 0.999)` | `beta2=0.95` stays safely within the bf16 quantisation window at full 50% VRAM savings. `beta2=0.999` triggers automatic fp32 escalation of `v_t` (25% savings). | `betas=(0.9, 0.999)` |
 | **`precision`** | `"auto"` | Full FP32 (8 bytes/param) | Tensors $\ge 64\text{K}$ elements or 2D+ matrices receive compact 16-bit states, cutting state memory by 50%. 1D norms remain in FP32. | `precision="full"` |
 | **`decay_norm_only`** | `True` | `False` | Automatically excludes 1D tensors (LayerNorm/RMSNorm weights, biases) from weight decay, matching modern LLM best practices. | `decay_norm_only=False` |
 | **Dynamic Range Scaling** | `True` | N/A | Monitors variance magnitude and dynamically scales 16-bit second moments to prevent underflow. | `dynamic_scaling=False` |
@@ -97,26 +98,29 @@ While ApexW follows PyTorch optimizer conventions, its default settings are tune
 > [!IMPORTANT]
 > **Beta2 × Compact Precision Compatibility**
 >
-> When `beta2 >= 0.995` (including the default AdamW value of **0.999**) with compact precision, the per-step EMA contribution `(1 - beta2) * g²` falls below the bf16 quantisation step of the accumulated `v_t`. This causes `v_t` to silently stagnate — the second moment freezes and stops tracking gradient statistics, inflating effective learning rate.
+> When `beta2 >= 0.995` (including the legacy AdamW value of **0.999**) with compact precision, the per-step EMA contribution `(1 - beta2) * g²` falls below the bf16 quantisation step of the accumulated `v_t`. This causes `v_t` to silently stagnate — the second moment freezes and stops tracking gradient statistics, inflating effective learning rate.
 >
 > **ApexW automatically detects this and escalates `exp_avg_sq` to fp32** while keeping `exp_avg` in compact 16-bit. This costs 2 extra bytes per parameter but remains **25% cheaper than AdamW** (6 vs 8 bytes).
 >
 > | `beta2` | bf16 EMA margin | Effect | ApexW action |
 > | :--- | :--- | :--- | :--- |
-> | 0.95 | **6.4×** | Negligible | compact bf16 (50% savings) |
+> | **0.95** ⬅ *default* | **6.4×** | None | compact bf16 (50% savings) |
 > | 0.98 | **2.6×** | Very mild | compact bf16 (50% savings) |
 > | 0.99 | **1.3×** | Mild | compact bf16 + warning |
 > | 0.995 | **0.6×** | Significant | `v` auto-escalated to **fp32** (25% savings) |
 > | 0.999 | **0.1×** | **Severe** | `v` auto-escalated to **fp32** (25% savings) |
 >
-> LLM recipes using `beta2=0.95` are unaffected. Default AdamW users (`beta2=0.999`) are automatically protected.
-> To suppress the warning and keep all states in fp32: use `precision="full"`.
+> **ApexW's default `betas=(0.9, 0.95)` is pre-tuned to avoid these warnings entirely** — you get full 50% VRAM savings out of the box with no silent fallbacks.
+> LLM recipes using `beta2=0.95` (e.g., Chinchilla, Llama, Mistral recipes) are naturally compatible. If you must use `beta2=0.999`, automatic fp32 escalation keeps correctness intact.
+> To suppress warnings and keep all states in fp32: use `precision="full"`.
 
 > [!NOTE]
 > If you require exact numerical equivalence to PyTorch AdamW for debugging:
 > ```python
-> optimizer = ApexW(model.parameters(), lr=1e-3, precision="full", decay_norm_only=False)
+> # Explicitly match AdamW's defaults (beta2=0.999, no norm-only decay)
+> optimizer = ApexW(model.parameters(), lr=1e-3, betas=(0.9, 0.999), precision="full", decay_norm_only=False)
 > ```
+
 
 ---
 
