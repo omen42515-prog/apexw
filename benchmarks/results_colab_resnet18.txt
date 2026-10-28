@@ -1,0 +1,13 @@
+test run in google collab 
+━━━ Detailed Final Results ━━━
+Optimizer 	Throughput (Steps/s) 	Latency (ms/step) 	Optimizer State (MB) 	Val Loss 	Peak Alloc (MB) 	Peak Extra (MB)
+ApexW 	50.53 	19.788 	128.11 	0.451324 	1016.16 	114.50
+AdamW Fused 	46.86 	21.342 	256.11 	0.450366 	1144.16 	114.50
+Lion 	36.22 	27.608 	128.05 	0.646728 	1032.11 	130.50
+AdamW 	34.98 	28.588 	256.11 	0.450364 	1160.19 	130.53
+Adam 	34.83 	28.709 	256.11 	1.099625 	1224.19 	194.53
+━━━ Key Highlights ━━━
+
+    Maximum Speed: ApexW achieves the absolute highest performance at 50.53 steps/s, outpacing PyTorch's native AdamW Fused (46.86 steps/s) by 7.8% and leaving standard unfused AdamW (34.98 steps/s) far behind.
+    Unbeatable Memory Savings: ApexW uses only 128.11 MB for optimizer states (a perfect 50% state memory reduction over AdamW Fused's 256.11 MB). This directly translates to lower overall peak GPU allocation during scaling.
+
