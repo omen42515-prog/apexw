@@ -353,6 +353,106 @@ optimizer = ApexWZeRO(model.parameters(), lr=1e-3, world_size=world_size, rank=r
 
 ---
 
+## 🔮 Complete Optimizer Configuration Matrix
+
+When designing or training neural networks you can end up with highly unconventional architectures. Use this matrix to pick the right ApexW settings without trial and error.
+
+| # | Architecture | `torch.compile` | `auto_pack` | `pack_threshold` |
+| :---: | :--- | :---: | :---: | :---: |
+| 1 | **Mega-Deep Spindle** — 200 + tiny layers, small params | ✅ | ✅ `True` | default |
+| 2 | **Monolith Pillar** — 1–2 massive layers (huge embeddings) | ✅ | ❌ `False` | — |
+| 3 | **Hybrid Chimera** — giant embeddings + hundreds of tiny blocks | ✅ | ✅ `True` | low (e.g. `50_000`) |
+| 4 | **Extreme Shallow-Wide** — few layers, massive parallel paths | optional | ❌ `False` | — |
+| 5 | **Memory-Starved Edge Device** — limited VRAM | ✅ | ❌ `False` | — |
+| 6 | **CPU Fallback** — no GPU available | ❌ | ❌ `False` | — |
+
+---
+
+### Scenario Details
+
+#### 1 — The Mega-Deep Spindle *(200+ tiny layers)*
+
+> [!TIP]
+> **Maximum Speed (up to 47% faster):** `auto_pack` fuses hundreds of sequential tiny operations into larger coalesced kernels, eliminating Python-dispatch latency entirely. Pair with `torch.compile` to strip away remaining Python orchestration overhead.
+
+```python
+model = DeepSpindleModel()  # 200+ tiny layers
+optimizer = ApexW(model.parameters(), lr=1e-3, auto_pack=True)
+compiled_model = torch.compile(model)
+```
+
+---
+
+#### 2 — The Monolith Pillar *(1–2 massive layers)*
+
+> [!TIP]
+> **Fastest speed + maximum memory savings:** With only one or two large kernels, launch overhead is negligible. Packing giant tensors dynamically wastes VRAM — keep `auto_pack=False`.
+
+```python
+model = MonolithModel()  # e.g. a single 4096×32000 LM head
+optimizer = ApexW(model.parameters(), lr=1e-3, auto_pack=False)
+compiled_model = torch.compile(model)
+```
+
+---
+
+#### 3 — The Hybrid Chimera *(huge embedding + many tiny blocks)*
+
+> [!TIP]
+> **Optimal balance:** Set `pack_threshold` below the embedding's element count so `auto_pack` only fuses the small blocks, leaving the large embedding tensor untouched and saving VRAM.
+
+```python
+# Embedding has 50 M elements — threshold keeps it out of the pack buffer
+optimizer = ApexW(
+    model.parameters(),
+    lr=1e-3,
+    auto_pack=True,
+    pack_threshold=50_000,   # only pack params with numel < 50 K
+)
+compiled_model = torch.compile(model)
+```
+
+---
+
+#### 4 — The Extreme Shallow-Wide *(few layers, massive parallel paths)*
+
+> [!NOTE]
+> **Low overhead mode:** Wide layers naturally execute in parallel — no packing benefit. The overhead of managing pack memory segments would outweigh any minor launch savings here.
+
+```python
+model = ShallowWideModel()
+optimizer = ApexW(model.parameters(), lr=1e-3, auto_pack=False)
+# torch.compile optional — test with and without for your specific shape
+```
+
+---
+
+#### 5 — The Memory-Starved Edge Device *(limited VRAM)*
+
+> [!IMPORTANT]
+> **Peak VRAM reduction (~20% additional savings):** `torch.compile` reuses intermediate activation buffers aggressively. Disable `auto_pack` to prevent temporary indexing overhead from adding pressure on an already-tight memory budget.
+
+```python
+model = LightweightModel().to("cuda")
+optimizer = ApexW(model.parameters(), lr=1e-3, auto_pack=False, precision="compact")
+compiled_model = torch.compile(model)
+```
+
+---
+
+#### 6 — The CPU Fallback *(no GPU)*
+
+> [!NOTE]
+> **Eager mode, no packing:** `auto_pack` relies on dynamic memory alignment optimised for GPU parallelism. On CPU, PyTorch's eager foreach path is already optimal — keep both options off.
+
+```python
+model = AnyModel().to("cpu")
+optimizer = ApexW(model.parameters(), lr=1e-3, auto_pack=False)
+# Do NOT call torch.compile here — Dynamo overhead dominates on CPU for small models
+```
+
+---
+
 ## Repository Structure
 
 ```
