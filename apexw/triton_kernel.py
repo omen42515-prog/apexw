@@ -111,6 +111,41 @@ def _next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
+def _triton_preflight_check(
+    param: torch.Tensor,
+    grad: torch.Tensor,
+    exp_avg: torch.Tensor,
+    exp_avg_sq: torch.Tensor,
+) -> Optional[str]:
+    """
+    Validates tensor layout, device, and dtype before any Triton kernel is launched.
+    Returns None if all checks pass, or a human-readable reason string if not supported.
+    This is the Fix 4 pre-flight: distinguishes 'unsupported config' (safe to return False)
+    from 'failure after kernel already mutated state' (must raise, not silently retry).
+    """
+    _SUPPORTED_DTYPES = {torch.float32, torch.float16, torch.bfloat16}
+
+    if not param.is_cuda:
+        return f"param must be a CUDA tensor (got device={param.device})"
+    if not grad.is_cuda:
+        return f"grad must be a CUDA tensor (got device={grad.device})"
+    if param.device != grad.device:
+        return f"param and grad must be on the same device ({param.device} vs {grad.device})"
+    if param.device != exp_avg.device or param.device != exp_avg_sq.device:
+        return "param, exp_avg, exp_avg_sq must all be on the same device"
+    if param.numel() != grad.numel():
+        return f"param and grad have different element counts ({param.numel()} vs {grad.numel()})"
+    if param.dtype not in _SUPPORTED_DTYPES:
+        return f"param dtype {param.dtype} not supported by Triton kernel"
+    if grad.dtype not in _SUPPORTED_DTYPES:
+        return f"grad dtype {grad.dtype} not supported by Triton kernel"
+    if exp_avg.dtype not in _SUPPORTED_DTYPES:
+        return f"exp_avg dtype {exp_avg.dtype} not supported by Triton kernel"
+    if exp_avg_sq.dtype not in _SUPPORTED_DTYPES:
+        return f"exp_avg_sq dtype {exp_avg_sq.dtype} not supported by Triton kernel"
+    return None  # all checks passed
+
+
 def triton_adamw_step(
     param: torch.Tensor,
     grad: torch.Tensor,
@@ -129,7 +164,14 @@ def triton_adamw_step(
     apply_wd: bool = True,
     block_size: Optional[int] = None,
 ) -> bool:
-    """Executes the Triton fused AdamW kernel on a single tensor."""
+    """
+    Executes the Triton fused AdamW kernel on a single tensor.
+
+    Fix 4: All preflight checks (device, dtype, layout, shape) are performed BEFORE
+    the kernel is launched. Returns False only when no mutations have been made.
+    If the kernel is launched and fails, the exception propagates (does not return False),
+    preventing the caller from silently re-running the same parameter with a fallback.
+    """
     if not is_triton_available():
         return False
 
@@ -137,10 +179,17 @@ def triton_adamw_step(
     if n_elements == 0:
         return True
 
+    # Fix 4: Pre-flight validation — all checks before any mutation.
+    reason = _triton_preflight_check(param, grad, exp_avg, exp_avg_sq)
+    if reason is not None:
+        if os.environ.get("APEXW_DEBUG", "0") == "1":
+            print(f"[ApexW] Triton pre-flight rejected: {reason}")
+        return False  # Safe: no kernel has run yet.
+
     if block_size is None:
         block_size = min(max(64, _next_power_of_2(n_elements)), 1024)
 
-    # Ensure tensors are contiguous
+    # Ensure tensors are contiguous — this is a mutation of metadata, not of values.
     if not param.is_contiguous():
         param.data = param.contiguous()
     if not grad.is_contiguous():
@@ -152,31 +201,29 @@ def triton_adamw_step(
 
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
 
-    try:
-        _adamw_kernel_triton[grid](
-            param,
-            grad,
-            exp_avg,
-            exp_avg_sq,
-            n_elements,
-            float(lr),
-            float(beta1),
-            float(beta2),
-            float(eps),
-            float(weight_decay),
-            float(step_size),
-            float(eps_scaled),
-            float(scale_v),
-            float(sqrt_scale_v),
-            float(inv_scale),
-            apply_wd=bool(apply_wd),
-            BLOCK_SIZE=block_size,
-        )
-        return True
-    except Exception as e:
-        if os.environ.get("APEXW_DEBUG", "0") == "1":
-            print(f"[ApexW] Triton kernel execution failed: {e}")
-        return False
+    # Fix 4: After this point, the kernel WILL mutate param, exp_avg, exp_avg_sq.
+    # Any exception here must NOT be caught and silently converted to False —
+    # the caller must know that the parameter has been partially updated.
+    _adamw_kernel_triton[grid](
+        param,
+        grad,
+        exp_avg,
+        exp_avg_sq,
+        n_elements,
+        float(lr),
+        float(beta1),
+        float(beta2),
+        float(eps),
+        float(weight_decay),
+        float(step_size),
+        float(eps_scaled),
+        float(scale_v),
+        float(sqrt_scale_v),
+        float(inv_scale),
+        apply_wd=bool(apply_wd),
+        BLOCK_SIZE=block_size,
+    )
+    return True
 
 
 def triton_multi_tensor_adamw_step(
@@ -199,11 +246,26 @@ def triton_multi_tensor_adamw_step(
     Executes the Triton fused AdamW kernel across multiple tensors.
     Works natively on both NVIDIA CUDA and AMD ROCm GPUs with zero C++ compilation.
     Fuses gradient unscaling in-kernel when running under PyTorch AMP GradScaler.
+
+    Fix 4: ALL tensors are pre-flight validated before any kernel is launched.
+    If any tensor fails validation, returns False before touching any parameter.
+    If a kernel succeeds then a later one raises, the exception propagates (not caught)
+    so the caller cannot silently re-run the whole group through a fallback path.
     """
     if not is_triton_available():
         return False
     if len(params) == 0:
         return True
+
+    # Fix 4: Validate the ENTIRE batch before launching ANY kernel.
+    # This distinguishes "unsupported configuration" (safe False) from
+    # "failure mid-batch after some params already mutated" (must raise).
+    for i, p in enumerate(params):
+        reason = _triton_preflight_check(p, grads[i], exp_avgs[i], exp_avg_sqs[i])
+        if reason is not None:
+            if os.environ.get("APEXW_DEBUG", "0") == "1":
+                print(f"[ApexW] Triton pre-flight rejected param[{i}]: {reason}")
+            return False  # Safe: no kernel has run yet.
 
     bc1 = 1.0 - (beta1 ** step)
     bc2 = 1.0 - (beta2 ** step)
@@ -211,6 +273,10 @@ def triton_multi_tensor_adamw_step(
     step_size = lr * bc2_sqrt / bc1
     eps_scaled = eps * bc2_sqrt
 
+    # Fix 4: After this loop begins, parameters are being mutated one by one.
+    # Any exception after the first successful kernel call MUST propagate —
+    # do not catch and return False, which would cause the caller to re-run
+    # the entire group through a fallback path, double-updating already-modified params.
     for i, p in enumerate(params):
         g = grads[i]
         m = exp_avgs[i]
@@ -226,7 +292,9 @@ def triton_multi_tensor_adamw_step(
             scale_v = scales_v[id(p)]
             sqrt_scale_v = math.sqrt(scale_v)
 
-        success = triton_adamw_step(
+        # triton_adamw_step no longer catches exceptions after the kernel launches,
+        # so any failure here correctly aborts the step.
+        triton_adamw_step(
             param=p,
             grad=g,
             exp_avg=m,
@@ -244,7 +312,5 @@ def triton_multi_tensor_adamw_step(
             apply_wd=apply_wd,
             block_size=block_size,
         )
-        if not success:
-            return False
 
     return True
