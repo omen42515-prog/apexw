@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 import copy
 import torch
 import torch.nn as nn
@@ -2285,6 +2286,35 @@ class TestParameterFlattening(unittest.TestCase):
 
         for p_ref, p_pack in zip(m_ref.parameters(), m_pack.parameters()):
             self.assertTrue(torch.allclose(p_ref, p_pack, atol=1e-6))
+
+    def test_triton_adaptive_block_size(self):
+        """Verify Triton adaptive block size and _next_power_of_2 helper."""
+        from apexw.triton_kernel import _next_power_of_2
+
+        self.assertEqual(_next_power_of_2(0), 1)
+        self.assertEqual(_next_power_of_2(1), 1)
+        self.assertEqual(_next_power_of_2(63), 64)
+        self.assertEqual(_next_power_of_2(64), 64)
+        self.assertEqual(_next_power_of_2(65), 128)
+        self.assertEqual(_next_power_of_2(512), 512)
+        self.assertEqual(_next_power_of_2(1000), 1024)
+
+    def test_compiling_multi_tensor_dynamo_guards(self):
+        """Verify that running under torch.compile mock does not trigger graph breaks or crash with AdEMAMix."""
+        from apexw import ApexW
+        import apexw.optimizer as opt_mod
+
+        p1 = nn.Parameter(torch.randn(8, 8))
+        p2 = nn.Parameter(torch.randn(8, 8))
+        opt = ApexW([p1, p2], lr=1e-3, beta3=0.999, alpha=5.0, precision="full")
+
+        (p1.sum() + p2.sum()).backward()
+
+        with patch.object(opt_mod, "is_compiling", return_value=True):
+            opt.step()
+
+        self.assertEqual(opt.state[p1]["step"].item(), 1.0)
+        self.assertEqual(opt.state[p2]["step"].item(), 1.0)
 
 
 if __name__ == "__main__":
