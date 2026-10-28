@@ -361,7 +361,7 @@ When designing or training neural networks you can end up with highly unconventi
 
 ---
 
-### The Three Knobs Explained (Plain English)
+### The Three Knobs Explained 
 
 | Knob | What it does | When to change it |
 | :--- | :--- | :--- |
