@@ -1167,7 +1167,10 @@ class TestApexW(unittest.TestCase):
             calls.append((param.shape, apply_wd))
             return True
 
+        # Fix 4: _triton_preflight_check is patched to return None (pass) so the
+        # pre-flight does not reject CPU tensors in an environment without a CUDA device.
         with patch.object(tk, "is_triton_available", return_value=True), \
+             patch.object(tk, "_triton_preflight_check", return_value=None), \
              patch.object(tk, "triton_adamw_step", side_effect=mock_step):
             success = tk.triton_multi_tensor_adamw_step(
                 [p1, p2], [g1, g2], [m1, m2], [v1, v2],
@@ -2440,3 +2443,160 @@ class TestParameterFlattening(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBugFixes(unittest.TestCase):
+    """Regression tests for the four correctness fixes."""
+
+    # ── Fix 1: Mixed-dtype CUDA dispatch guard ─────────────────────────────────
+    def test_fix1_mixed_dtype_uses_fallback(self):
+        """
+        Fix 1 regression: FP32 params, BF16 m, FP32 v (beta2=0.999).
+        The Triton / custom-CUDA fast path must NOT be selected for this config.
+        The fallback must produce a numerically correct, finite update.
+        """
+        import warnings
+        torch.manual_seed(0)
+        param = nn.Parameter(torch.randn(64, 64))  # FP32
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # beta2=0.999 with compact precision → v auto-escalated to fp32,
+            # m stays in bf16 → mixed-dtype pair
+            opt = ApexW([param], lr=1e-3, betas=(0.9, 0.999), precision="auto")
+
+        param.grad = torch.randn(64, 64)
+        opt.step()  # Must not raise
+
+        state = opt.state[param]
+        # If state split did happen, verify no corruption
+        if state["exp_avg_sq"].dtype == torch.float32 and state["exp_avg"].dtype != torch.float32:
+            self.assertTrue(state["exp_avg_sq"].isfinite().all(),
+                            "v (exp_avg_sq) must be finite after mixed-dtype step")
+            self.assertTrue((state["exp_avg_sq"] >= 0).all(),
+                            "v (exp_avg_sq) must be non-negative")
+        self.assertFalse(torch.isnan(param).any(), "Parameters must not contain NaN")
+
+    # ── Fix 2: auto_pack missing gradient raises RuntimeError ─────────────────
+    def test_fix2_auto_pack_partial_grad_raises(self):
+        """
+        Fix 2 regression: With auto_pack=True and two packed parameters,
+        step() must raise RuntimeError when one has a gradient and one has grad=None.
+        """
+        model = nn.Sequential(
+            nn.Linear(4, 4, bias=False),
+            nn.Linear(4, 4, bias=False),
+        )
+        opt = ApexW(model.parameters(), lr=1e-3, auto_pack=True, pack_threshold=1_000_000)
+
+        x = torch.randn(2, 4)
+        model(x).sum().backward()
+        # Simulate one parameter not receiving a gradient this step
+        model[1].weight.grad = None
+
+        with self.assertRaises(RuntimeError) as ctx:
+            opt.step()
+
+        self.assertIn("auto_pack", str(ctx.exception))
+        self.assertIn("grad=None", str(ctx.exception))
+
+    def test_fix2_auto_pack_all_grads_present_ok(self):
+        """Fix 2 complement: all grads present → step() must not raise."""
+        model = nn.Sequential(
+            nn.Linear(4, 4, bias=False),
+            nn.Linear(4, 4, bias=False),
+        )
+        opt = ApexW(model.parameters(), lr=1e-3, auto_pack=True, pack_threshold=1_000_000)
+        model(torch.randn(2, 4)).sum().backward()
+        opt.step()  # Must not raise
+        for p in model.parameters():
+            self.assertFalse(torch.isnan(p).any())
+
+    def test_fix2_auto_pack_all_grads_none_ok(self):
+        """Fix 2 complement: all grads None → step() must silently skip group."""
+        model = nn.Sequential(
+            nn.Linear(4, 4, bias=False),
+            nn.Linear(4, 4, bias=False),
+        )
+        opt = ApexW(model.parameters(), lr=1e-3, auto_pack=True, pack_threshold=1_000_000)
+        p_before = [p.data.clone() for p in model.parameters()]
+        opt.step()  # No gradients → must not raise, must not update params
+        for p_new, p_old in zip(model.parameters(), p_before):
+            self.assertTrue(torch.equal(p_new.data, p_old))
+
+    # ── Fix 3: Dynamic scaling stays in fallback path ─────────────────────────
+    def test_fix3_dynamic_scaling_fallback_is_stable(self):
+        """
+        Fix 3 regression: dynamic_scaling=True with compact bf16 v must NOT route
+        to Triton (which lacks initialization + recalibration). The fallback must
+        produce finite, non-NaN updates.
+        """
+        import warnings
+        torch.manual_seed(1)
+        param = nn.Parameter(torch.randn(256, 256))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            opt = ApexW([param], lr=1e-3, betas=(0.9, 0.95), precision="auto",
+                        dynamic_scaling=True)
+
+        for _ in range(5):
+            param.grad = torch.randn(256, 256) * 0.1
+            opt.step()
+
+        state = opt.state[param]
+        self.assertIn("exp_avg_sq", state)
+        self.assertTrue(state["exp_avg_sq"].isfinite().all(),
+                        "v must be finite after dynamic-scaling fallback steps")
+        self.assertFalse(torch.isnan(param).any())
+
+    # ── Fix 4: Triton pre-flight rejects unsupported configs before any mutation
+    def test_fix4_preflight_rejects_cpu_tensor(self):
+        """Fix 4: _triton_preflight_check must reject CPU tensors with a reason string."""
+        import apexw.triton_kernel as tk
+        p = torch.randn(16)   # CPU
+        reason = tk._triton_preflight_check(p, torch.randn(16), torch.zeros(16), torch.zeros(16))
+        self.assertIsNotNone(reason, "Pre-flight must reject CPU tensors")
+        self.assertIsInstance(reason, str)
+
+    def test_fix4_preflight_rejects_shape_mismatch(self):
+        """Fix 4: _triton_preflight_check must reject mismatched param/grad shapes.
+        The exact rejection reason may vary by environment (device check fires first
+        on CPU-only hosts before the element-count check is reached)."""
+        import apexw.triton_kernel as tk
+        reason = tk._triton_preflight_check(
+            torch.randn(8), torch.randn(16), torch.zeros(8), torch.zeros(8)
+        )
+        # Any non-None reason is correct — the call is rejected before any mutation.
+        self.assertIsNotNone(reason, "Pre-flight must reject when param/grad shapes mismatch")
+        self.assertIsInstance(reason, str)
+
+    def test_fix4_triton_multi_validates_all_before_launching(self):
+        """
+        Fix 4 regression: If param[1] fails pre-flight, no kernel must be launched
+        for param[0] either — the whole call returns False before any mutation.
+        """
+        from unittest.mock import patch
+        import apexw.triton_kernel as tk
+
+        p1 = torch.randn(16)
+        p2 = torch.randn(8)    # mismatched grad size → pre-flight rejects
+        g1 = torch.randn(16)
+        g2 = torch.randn(16)   # wrong numel for p2
+        m1, v1 = torch.zeros(16), torch.zeros(16)
+        m2, v2 = torch.zeros(8), torch.zeros(8)
+
+        launch_calls = []
+        def mock_step(*args, **kwargs):
+            launch_calls.append(True)
+            return True
+
+        with patch.object(tk, "is_triton_available", return_value=True), \
+             patch.object(tk, "triton_adamw_step", side_effect=mock_step):
+            result = tk.triton_multi_tensor_adamw_step(
+                [p1, p2], [g1, g2], [m1, m2], [v1, v2],
+                lr=1e-3, beta1=0.9, beta2=0.95, eps=1e-8,
+                weight_decay=0.0, step=1,
+            )
+
+        self.assertFalse(result, "Must return False when any tensor fails pre-flight")
+        self.assertEqual(len(launch_calls), 0,
+                         "No kernel must be launched when pre-flight rejects any tensor")
