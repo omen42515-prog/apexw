@@ -19,7 +19,8 @@ class TestApexW(unittest.TestCase):
         p_apex = nn.Parameter(torch.tensor([-1.5, 2.0]))
 
         opt_adamw = torch.optim.AdamW([p_adamw], lr=0.01, weight_decay=0.0)
-        opt_apex = ApexW([p_apex], lr=0.01, weight_decay=0.0, precision="full")
+        # Use same betas as AdamW to test numerical equivalence in full precision
+        opt_apex = ApexW([p_apex], lr=0.01, weight_decay=0.0, precision="full", betas=(0.9, 0.999))
 
         def rosenbrock(p):
             return (1.0 - p[0])**2 + 100.0 * (p[1] - p[0]**2)**2
@@ -37,7 +38,7 @@ class TestApexW(unittest.TestCase):
         final_apex = rosenbrock(p_apex).item()
 
         print(f"\nRosenbrock Final Loss -> AdamW: {final_adam:.6f} | ApexW: {final_apex:.6f}")
-        # Full precision ApexW matches AdamW closely
+        # Full precision ApexW with same betas matches AdamW closely
         self.assertAlmostEqual(final_apex, final_adam, places=4)
 
     def test_memory_reduction(self):
@@ -366,7 +367,8 @@ class TestApexW(unittest.TestCase):
         p1 = nn.Parameter(torch.randn(4))
         p2 = nn.Parameter(p1.data.clone())
 
-        opt1 = ApexW([p1], lr=1e-3, weight_decay=0.0, precision="full")
+        # Use same betas as AdamW to test numerical equivalence in full precision
+        opt1 = ApexW([p1], lr=1e-3, weight_decay=0.0, precision="full", betas=(0.9, 0.999))
         opt2 = torch.optim.AdamW([p2], lr=1e-3, weight_decay=0.0)
 
         torch.manual_seed(99)
@@ -1105,7 +1107,8 @@ class TestApexW(unittest.TestCase):
         p_xla = nn.Parameter(torch.tensor([-1.5, 2.0]))
 
         opt_adamw = torch.optim.AdamW([p_adamw], lr=0.01, weight_decay=0.0)
-        opt_xla = ApexW([p_xla], lr=0.01, weight_decay=0.0, precision="full", backend="xla")
+        # Use same betas as AdamW to test numerical equivalence
+        opt_xla = ApexW([p_xla], lr=0.01, weight_decay=0.0, precision="full", backend="xla", betas=(0.9, 0.999))
 
         def rosenbrock(p):
             return (1.0 - p[0])**2 + 100.0 * (p[1] - p[0]**2)**2
