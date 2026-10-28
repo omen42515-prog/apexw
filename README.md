@@ -55,7 +55,7 @@ optimizer.print_summary()
 #### ⚡ Recommended: AMP (Automatic Mixed Precision) Training
 
 > [!TIP]
-> **This is where ApexW really pulls ahead.** Under AMP, ApexW consistently outperforms both standard and fused `torch.optim.AdamW` — bf16 activations + compact bf16 optimizer states + a single fused Triton kernel all compound at once. If you're on a CUDA GPU, always prefer one of these loops over plain float32.
+> **This is where ApexW really pulls ahead.** Under AMP, ApexW consistently outperforms both standard and fused `torch.optim.AdamW` — bf16 activations, compact bf16 optimizer states, and in-kernel AMP gradient unscaling all compound at once. On the Triton path, ApexW launches one fused per-parameter Triton kernel (not a single kernel across all parameters), keeping launch overhead low while gradient unscaling is fused directly into the update — no auxiliary VRAM allocation needed. If you're on a CUDA GPU, always prefer one of these loops over plain float32.
 
 **Not sure which path to take? Run this first:**
 
@@ -439,7 +439,7 @@ When designing or training neural networks you can end up with highly unconventi
 
 ---
 
-### The Three Knobs Explained
+### The Three Knobs Explained (Plain English)
 
 | Knob | What it does | When to change it |
 | :--- | :--- | :--- |
