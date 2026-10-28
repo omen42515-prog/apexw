@@ -1,4 +1,5 @@
 import math
+import warnings
 from collections import defaultdict
 from collections.abc import MutableMapping
 import torch
@@ -106,6 +107,39 @@ def _get_compact_dtype(p: Tensor) -> torch.dtype:
     if hasattr(torch, "bfloat16"):
         return torch.bfloat16
     return torch.float32
+
+
+# ── Beta2 precision thresholds ───────────────────────────────────────────────
+# The bf16 steady-state EMA update margin is (1 - beta2) * 128. When this
+# falls below 1.0, the per-step gradient² contribution is smaller than the
+# bf16 quantisation step of v_t, causing the EMA to silently stagnate.
+#
+# Threshold  Margin  Effect
+# beta2<0.99  >1.28x  Negligible (LLM recipes at 0.95/0.98 are safe)
+# 0.99..0.995  ~0.64x  Mild – occasional updates dropped; dynamic scaling helps
+# ≥0.995      <0.64x  Severe – v_t effectively freezes; force v to fp32
+#
+# Many LLM recipes use beta2=0.95; default AdamW uses beta2=0.999 (severe risk).
+_BETA2_WARN_THRESHOLD = 0.99   # Issue a warning
+_BETA2_V_FP32_THRESHOLD = 0.995  # Force second-moment state to fp32
+
+
+def _get_v_dtype_for_beta2(compact_dtype: torch.dtype, beta2: float) -> torch.dtype:
+    """Return the dtype to use for the second-moment (variance) buffer.
+
+    When ``beta2 >= _BETA2_V_FP32_THRESHOLD``, the per-step EMA contribution
+    ``(1 - beta2) * g²`` falls below the bf16/fp16 quantisation step of the
+    accumulated ``v_t``.  This causes ``v_t`` to stagnate — the EMA stops
+    tracking gradient statistics — inflating the effective learning rate and
+    destabilising long training runs.
+
+    The fix is to store ``v`` (``exp_avg_sq``) in ``float32`` while keeping
+    ``m`` (``exp_avg``) in the compact dtype.  This costs 2 extra bytes per
+    parameter (6 vs 4 total) but remains 25 % cheaper than full AdamW (8 bytes).
+    """
+    if compact_dtype in (torch.bfloat16, torch.float16) and beta2 >= _BETA2_V_FP32_THRESHOLD:
+        return torch.float32
+    return compact_dtype
 
 
 def _get_scalar_dtype(is_fused: bool = False) -> torch.dtype:
@@ -366,6 +400,38 @@ class ApexW(Optimizer):
         if backend is not None and backend not in ("auto", "triton", "cuda", "mps", "foreach", "_multi_tensor", "xla"):
             raise ValueError(f"Invalid backend '{backend}'. Must be 'auto', 'triton', 'cuda', 'mps', 'foreach', or 'xla'.")
 
+        # ── Beta2 × compact precision compatibility warning ────────────────────
+        # At beta2 ≥ 0.999 (default AdamW), (1 - beta2) * 128 ≈ 0.13 — the
+        # per-step gradient² contribution falls 8× below bf16 resolution,
+        # causing v_t to stagnate after warmup.  ApexW auto-escalates v to fp32
+        # when beta2 ≥ _BETA2_V_FP32_THRESHOLD (0.995), which costs 2 extra bytes
+        # per parameter but corrects the numerical behaviour.
+        # At 0.99 ≤ beta2 < 0.995 the effect is mild; a warning is issued.
+        _beta2_val = betas[1]
+        if precision in ("auto", "compact") and _beta2_val >= _BETA2_WARN_THRESHOLD:
+            _margin = (1.0 - _beta2_val) * 128  # bf16 EMA headroom (mantissa bits)
+            if _beta2_val >= _BETA2_V_FP32_THRESHOLD:
+                # Severe: auto-escalate v to fp32 (handled in _init_group)
+                warnings.warn(
+                    f"ApexW: beta2={_beta2_val} with precision='{precision}' activates "
+                    f"severe bf16 second-moment stagnation (bf16 margin ≈ {_margin:.2f}×). "
+                    f"exp_avg_sq (v) will be automatically stored in float32 to preserve "
+                    f"numerical correctness, saving 25% vs AdamW instead of 50%. "
+                    f"To suppress: use precision='full' or set beta2 < {_BETA2_V_FP32_THRESHOLD}.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            else:
+                # Mild (0.99 ≤ beta2 < 0.995): warn but don't escalate automatically
+                warnings.warn(
+                    f"ApexW: beta2={_beta2_val} with precision='{precision}' may cause mild "
+                    f"bf16 second-moment precision loss (bf16 margin ≈ {_margin:.2f}×). "
+                    f"Consider beta2 < 0.99 or precision='full' for long training runs. "
+                    f"Dynamic range scaling will partially compensate.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
         defaults = dict(
             lr=lr,
             betas=(betas[0], betas[1]),
@@ -604,6 +670,8 @@ class ApexW(Optimizer):
                     )
 
                     threshold = group.get("threshold", 65536)
+                    beta2 = group["betas"][1]
+
                     if group["precision"] == "auto":
                         # Smart Auto Partitioning:
                         # Massive 2D+ tensors or tensors >= threshold (>99.8% of model parameters)
@@ -612,45 +680,57 @@ class ApexW(Optimizer):
                         # receive full precision (float32) for zero precision drift and fast native foreach.
                         is_massive = (p.dim() >= 2) or (p.numel() >= threshold)
                         if is_massive:
-                            state_dtype = _get_compact_dtype(p)
+                            compact_dtype = _get_compact_dtype(p)
                         else:
-                            state_dtype = p.dtype if torch.is_complex(p) else torch.float32
+                            compact_dtype = p.dtype if torch.is_complex(p) else torch.float32
                     elif group["precision"] == "compact":
-                        state_dtype = _get_compact_dtype(p)
+                        compact_dtype = _get_compact_dtype(p)
                     else:  # "full"
-                        state_dtype = p.dtype if torch.is_complex(p) else torch.float32
-                    state["state_dtype"] = state_dtype
+                        compact_dtype = p.dtype if torch.is_complex(p) else torch.float32
 
-                    # Primary moment buffer
+                    # First-moment (m): always uses compact_dtype.
+                    state_dtype_m = compact_dtype
+                    # Second-moment (v): escalate to fp32 when beta2 is high enough
+                    # to cause bf16 EMA stagnation (see _get_v_dtype_for_beta2).
+                    # At beta2 >= 0.995, (1-beta2)*128 < 0.64x — updates are lost.
+                    # Storing v in fp32 costs 2 extra bytes/param but keeps v tracking.
+                    state_dtype_v = _get_v_dtype_for_beta2(compact_dtype, beta2)
+
+                    # Record the per-moment dtypes for downstream code to use
+                    state["state_dtype"] = state_dtype_m        # primary (backward-compat key)
+                    state["state_dtype_v"] = state_dtype_v      # second-moment dtype
+
+                    # Primary first-moment buffer
                     state["exp_avg"] = torch.zeros_like(
-                        p, dtype=state_dtype, memory_format=torch.preserve_format
+                        p, dtype=state_dtype_m, memory_format=torch.preserve_format
                     )
 
-                    # AdEMAMix slow moment buffer
+                    # AdEMAMix slow moment buffer (slow momentum, also first-order)
                     if has_slow_momentum:
                         state["exp_avg_slow"] = torch.zeros_like(
-                            p, dtype=state_dtype, memory_format=torch.preserve_format
+                            p, dtype=state_dtype_m, memory_format=torch.preserve_format
                         )
 
                     # Second moment buffer (variance EMA, not needed in Lion mode)
                     if not is_lion:
                         state["exp_avg_sq"] = torch.zeros_like(
-                            p, dtype=state_dtype, memory_format=torch.preserve_format
+                            p, dtype=state_dtype_v, memory_format=torch.preserve_format
                         )
                         if group["amsgrad"]:
                             state["max_exp_avg_sq"] = torch.zeros_like(
-                                p, dtype=state_dtype, memory_format=torch.preserve_format
+                                p, dtype=state_dtype_v, memory_format=torch.preserve_format
                             )
 
                 # Defensive initialization if amsgrad or AdEMAMix was enabled after initial step
                 state_dtype = state.get("state_dtype", p.dtype)
+                state_dtype_v = state.get("state_dtype_v", state_dtype)
                 if has_slow_momentum and "exp_avg_slow" not in state:
                     state["exp_avg_slow"] = torch.zeros_like(
                         p, dtype=state_dtype, memory_format=torch.preserve_format
                     )
                 if not is_lion and group["amsgrad"] and "max_exp_avg_sq" not in state:
                     state["max_exp_avg_sq"] = torch.zeros_like(
-                        p, dtype=state_dtype, memory_format=torch.preserve_format
+                        p, dtype=state_dtype_v, memory_format=torch.preserve_format
                     )
 
                 exp_avgs.append(state["exp_avg"])
