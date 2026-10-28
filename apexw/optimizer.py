@@ -853,12 +853,29 @@ class ApexW(Optimizer):
                 and not compiling
                 and not maximize
             )
-            # Only use Triton if all params share the same step counter.
-            # Params with intermittent gradients accumulate different step counts;
-            # the fused kernel only accepts a single step value for bias correction.
-            steps_are_uniform = len(state_steps) <= 1 or all(
-                _get_value(s) == _get_value(state_steps[0]) for s in state_steps[1:]
+            # Only evaluate steps_are_uniform when Triton or custom CUDA is viable.
+            # Avoid calling _get_value (Tensor.item()) under torch.compile to prevent Dynamo graph breaks.
+            steps_are_uniform = False
+            can_use_cuda_fused = (
+                backend in (None, "auto", "cuda")
+                and is_cuda
+                and not cautious
+                and not nesterov
+                and beta3 is None
+                and not lion
+                and not amsgrad
+                and not capturable
+                and not compiling
+                and not maximize
+                and backend_grad_scale is None
+                and found_inf is None
+                and is_cuda_kernel_available()
             )
+            if can_use_triton or can_use_cuda_fused:
+                steps_are_uniform = len(state_steps) <= 1 or all(
+                    _get_value(s) == _get_value(state_steps[0]) for s in state_steps[1:]
+                )
+
             if can_use_triton and steps_are_uniform:
                 step_val = int(_get_value(state_steps[0])) + 1
                 torch._foreach_add_(state_steps, 1)
@@ -1576,10 +1593,7 @@ class ApexW(Optimizer):
             # Guard: all params in this subgroup must have the same step counter.
             # When gradients are intermittent, step counts diverge and the kernel's
             # single-step bias correction would be wrong for the lagging parameters.
-            d_steps_uniform = len(d_steps) <= 1 or all(
-                _get_value(s) == _get_value(d_steps[0]) for s in d_steps[1:]
-            )
-            if (
+            can_cuda_fused = (
                 dev.type == "cuda"
                 and param_dt in (torch.float32, torch.bfloat16, torch.float16)
                 and state_dt in (torch.float32, torch.bfloat16, torch.float16)
@@ -1593,9 +1607,15 @@ class ApexW(Optimizer):
                 and not maximize
                 and grad_scale is None
                 and found_inf is None
-                and d_steps_uniform
                 and is_cuda_kernel_available()
-            ):
+            )
+            d_steps_uniform = False
+            if can_cuda_fused:
+                d_steps_uniform = len(d_steps) <= 1 or all(
+                    _get_value(s) == _get_value(d_steps[0]) for s in d_steps[1:]
+                )
+
+            if can_cuda_fused and d_steps_uniform:
                 step_val = int(_get_value(d_steps[0])) + 1
                 torch._foreach_add_(d_steps, 1)
                 success = fused_multi_tensor_adamw_cuda_step(
@@ -1675,10 +1695,15 @@ class ApexW(Optimizer):
                 bc2_sqrt_list = bias_correction2
                 # Bug 4 fix: slow_ratio must include bias-correction ratio bc1/bc3
                 if beta3 is not None:
-                    step_val = _get_value(d_steps[0])
-                    bc1_val = 1.0 - (beta1 ** step_val)
-                    bc3_val = 1.0 - (beta3 ** step_val)
-                    slow_ratio = alpha * (bc1_val / bc3_val)
+                    if compiling:
+                        bc1_t = 1.0 - (beta1 ** d_steps[0])
+                        bc3_t = 1.0 - (beta3 ** d_steps[0])
+                        slow_ratio = alpha * (bc1_t / bc3_t)
+                    else:
+                        step_val = _get_value(d_steps[0])
+                        bc1_val = 1.0 - (beta1 ** step_val)
+                        bc3_val = 1.0 - (beta3 ** step_val)
+                        slow_ratio = alpha * (bc1_val / bc3_val)
                 else:
                     slow_ratio = 0.0
             else:
