@@ -1,0 +1,17 @@
+### System Environment and Hardware Report
+* **GPU Model**: Tesla T4
+* **PyTorch Version**: 2.11.0+cu130
+* **CUDA Version**: 13.0
+* **Model Total Parameter Count**: 148,202,496 (~150M Params)
+
+### 3000-Step Hardware & Optimizer Scaling Stress-Test Summary
+*(Note: Peak VRAM values are labeled as absolute peak memory allocated across the entire training/evaluation run)*
+
+| Optimizer | Mean Step Time (ms) | Median Step Time (ms) | Throughput (Tokens/s) | Peak Run VRAM (GB) | Final Train Loss | Final Val Loss |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **AdamW** | 201.66 ms | 202.31 ms | 10123.3 tok/s | 5.808 GB | 5.1005 | 4.9998 |
+| **AdamW(fused)** | 172.29 ms | 172.12 ms | 11898.5 tok/s | 5.808 GB | 5.4807 | 5.2171 |
+| **ApexW** | 166.79 ms | 166.70 ms | 12285.2 tok/s | 5.260 GB | 5.0748 | 4.9637 |
+| **Muon** | 608.62 ms | 608.56 ms | 3365.3 tok/s | 5.539 GB | 3.9837 | 4.6943 |
+| **AdamW(Muon)** | 607.99 ms | 607.85 ms | 3369.2 tok/s | 5.806 GB | 3.3415 | 4.6180 |
+| **ApexW(Muon)** | 720.63 ms | 720.52 ms | 2842.4 tok/s | 5.252 GB | 3.4821 | 4.5683 |
