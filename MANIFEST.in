@@ -1,0 +1,5 @@
+recursive-include apexw/csrc *.cpp *.cu *.h *.cuh
+include README.md
+include requirements.txt
+include pyproject.toml
+include LICENSE*
