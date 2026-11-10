@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apexw"
+version = "1.2.0"
+description = "ApexW: Memory-Efficient Fused Optimizer for PyTorch — Cross-Hardware (CUDA, ROCm, Apple MPS, Google TPU)"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{name = "ApexW Contributors"}]
+dependencies = [
+    "torch>=2.0.0",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+# pip install apexw[triton]   → enables Triton JIT kernel (NVIDIA CUDA & AMD ROCm)
+triton = ["triton>=2.0.0"]
+# pip install apexw[tpu]      → enables Google TPU PyTorch XLA support
+tpu = ["torch_xla>=2.0.0"]
+# pip install apexw[all]      → all acceleration extras
+all = ["triton>=2.0.0", "torch_xla>=2.0.0"]
+
+[tool.setuptools.packages.find]
+exclude = ["tests*", "benchmarks*"]
+
+[tool.setuptools.package-data]
+apexw = ["csrc/*.cpp", "csrc/*.cu", "csrc/*.h", "csrc/*.cuh"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
