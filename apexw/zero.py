@@ -44,12 +44,7 @@ def _to_global_rank(group: Optional[Any], group_rank: int) -> int:
 
 class ApexWZeRO(Optimizer):
     r"""
-    ApexWZeRO: Native ZeRO Stage-1 Optimizer for Distributed PyTorch (Experimental).
-    
-    .. warning::
-        ApexWZeRO is currently an experimental research feature. For production
-        multi-GPU distributed training, PyTorch's native FSDP or DeepSpeed ZeRO
-        with ApexW is recommended.
+    ApexWZeRO: Native ZeRO Stage-1 Optimizer for Distributed PyTorch.
 
     Partitions optimizer historical state memory ($m_t$ and $v_t$) across ranks.
     Each GPU only allocates and updates $1 / \text{world\_size}$ of the model parameters.
@@ -703,4 +698,3 @@ class ZeROStateAdapter:
     def unpack_scaling_metadata(state_dict: Dict[str, Any]) -> float:
         """Extracts dynamic scaling factor after ZeRO reconstruction."""
         return float(state_dict.get("_apexw_scale_v", 1.0))
-
