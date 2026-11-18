@@ -1,3 +1,20 @@
+> **Note: comparing ApexW with AdamW?**
+>
+> ApexW's default settings are a little different from PyTorch's AdamW (mainly `betas` and weight decay on LayerNorm/bias weights). If you run both with their defaults, you're not testing the same thing, and ApexW can look slightly worse in a short run.
+>
+> To make the test fair, add one flag:
+>
+> ```python
+> optimizer = ApexW(model.parameters(), lr=6e-4, weight_decay=0.1, adamw_compat=True)
+> ```
+>
+> That makes ApexW use the same betas and weight decay as AdamW. Also compare peak GPU memory (`torch.cuda.max_memory_allocated()`), since saving memory is the whole point.
+>
+> Want to change `betas` yourself? See [How ApexW Defaults Differ from Standard AdamW](#how-apexw-defaults-differ-from-standard-adamw). It also lists the exact line numbers.
+
+
+---
+
 # ApexW — Train Bigger Models on Less Memory
 
 **ApexW saves you 50% to 90% of your GPU memory — by simply replacing one line of code.**
@@ -13,6 +30,16 @@ optimizer = ApexW(model.parameters(), lr=1e-3)
 ```
 
 Your training loop, your model, your data — **nothing else changes**. You just get a lot more free memory.
+
+### Quick pick
+
+| Mode | One-liner | Memory | Best for |
+|------|-----------|--------|---------|
+| **Compact** (default) | `ApexW(model.parameters(), lr=1e-3)` | 2.5 B/param | General use, any hardware |
+| **8-bit** | `ApexW(model.parameters(), lr=1e-3, precision="8bit")` | 0.754 B/param | Consumer GPUs, LoRA, large models |
+| **Hybrid Muon** | `ApexW(model, lr=1e-3, use_muon=True)` | ~4.0 B/param | Transformer pretraining from scratch |
+
+Details for each mode are in [Part 2](#part-2-how-to-use-apexw).
 
 ---
 
@@ -136,7 +163,7 @@ Just moving every dial by the same amount every time doesn't work well in practi
 **The problem:** AdamW keeps both of these numbers (momentum and variance) for **every single parameter** in the model. And it stores them in full 32-bit precision, which means 4 bytes each.
 
 So for every parameter, AdamW needs:
-- 4 bytes for the parameter itself
+- 4 bytes for the parameter itself (4 bytes in FP32, or 2 bytes in BF16/FP16)
 - 4 bytes for momentum
 - 4 bytes for variance
 - = **12 bytes total per parameter** (or **8 bytes just for the optimizer state**)
@@ -217,7 +244,7 @@ for epoch in range(10):  # Train for 10 full passes over the dataset
         inputs = inputs.cuda()    # Move input data to GPU
         targets = targets.cuda()  # Move labels to GPU
 
-        optimizer.zero_grad()          # Step A: Clear gradients from last step
+        optimizer.zero_grad(set_to_none=True)  # Step A: Clear gradients from last step (set_to_none=True clears them quickly)
         outputs = model(inputs)        # Step B: Run the model (forward pass)
         loss = criterion(outputs, targets)  # Step C: Calculate how wrong we were
         loss.backward()                # Step D: Figure out how to fix it (backprop)
@@ -734,7 +761,7 @@ optimizer = ApexW(model, lr=1e-3, precision="8bit")
 | `precision` | `"compact"` | **Mode.** `"compact"` = default; `"8bit"` = max savings; `"full"` = same as standard AdamW. |
 | `use_muon` | `False` | **Hybrid Muon.** `True` for Transformer pretraining. Must pass `model`, not `model.parameters()`. |
 | `weight_decay` | `1e-2` | **Regularization.** Keeps weights from getting too large. Try `0.1` for LLMs. |
-| `betas` | `(0.9, 0.99)` | **Momentum / variance decay.** Controls how fast the optimizer forgets old history. Rarely needs changing. |
+| `betas` | `(0.9, 0.99)` (compact) / `(0.9, 0.999)` (8bit, full) | **Momentum / variance decay.** Controls how fast the optimizer forgets old history. Rarely needs changing. |
 | `eps` | `1e-8` | **Stability constant.** Prevents division by zero. Never needs changing. |
 | `decay_norm_only` | `True` | **Smart weight decay.** Automatically skips decay for LayerNorm, RMSNorm, and bias layers. Leave on. |
 | `adamw_compat` | `False` | **Exact PyTorch AdamW behavior.** Set `True` for bit-for-bit reproducibility with `torch.optim.AdamW`. |
@@ -777,7 +804,7 @@ Or print the optimizer object:
 
 ```python
 print(optimizer)
-# ApexW(lr=0.001, betas=(0.9, 0.99), weight_decay=0.01, precision='8bit',
+# ApexW(lr=0.001, betas=(0.9, 0.999), weight_decay=0.01, precision='8bit',
 #       params=185,220,864, state_memory=140.42MB, vram_saved=90.6%)
 ```
 
@@ -785,19 +812,38 @@ print(optimizer)
 
 ## How ApexW Defaults Differ from Standard AdamW
 
-ApexW ships with slightly different defaults than `torch.optim.AdamW`:
+ApexW doesn't use exactly the same defaults as `torch.optim.AdamW`. Two things are different:
 
 | Setting | ApexW | PyTorch AdamW | Why |
 |---------|:-----:|:-------------:|-----|
-| `betas` | `(0.9, 0.99)` | `(0.9, 0.999)` | `beta2=0.99` adapts variance over ~100 steps instead of ~1,000. Faster adaptation works better with 16-bit storage, which can stagnate when `beta2` is close to 1. |
-| 1D weight decay | **Off** (skipped) | On | LayerNorm, RMSNorm, and biases should not be decayed — it hurts feature scaling. Standard practice in LLaMA, nanoGPT, DeepSeek. |
+| `betas` | `(0.9, 0.99)` in compact mode, `(0.9, 0.999)` in `8bit` and `full` | `(0.9, 0.999)` | With `beta2=0.99` the optimizer adapts to new gradients in about 100 steps instead of about 1,000. In compact mode (16-bit storage) a `beta2` very close to 1 can make the stored variance get stuck, so a lower value is the safer default. |
+| Weight decay on 1D weights | **Off** (skipped) | On | LayerNorm, RMSNorm and biases usually shouldn't be decayed. LLaMA, nanoGPT and DeepSeek do the same. |
 
 If you need exact PyTorch AdamW behavior:
 
 ```python
-optimizer = ApexW(model.parameters(), betas=(0.9, 0.999), adamw_compat=True)
-# adamw_compat=True also re-enables weight decay on 1D layers
+optimizer = ApexW(model.parameters(), lr=1e-3, adamw_compat=True)
+# adamw_compat=True switches betas to (0.9, 0.999) and turns weight decay back on for 1D layers
 ```
+
+### Changing betas
+
+**For one run (easiest):** pass `betas` when you create the optimizer. Whatever you pass is used as-is.
+
+```python
+optimizer = ApexW(model.parameters(), lr=6e-4, betas=(0.9, 0.95))
+```
+
+**For every run in your project:** edit `apexw/optimizer.py`.
+
+| Line | What's there | What to do |
+|------|--------------|-----------|
+| **1650** | `betas = (0.9, 0.999) if precision in ("8bit", "full") else (0.9, 0.99)` | Change the two tuples. The first is used for `8bit` and `full`, the second for `compact`. |
+| 1615 | `betas: ... = None` in `ApexW.__init__` | Leave it as `None`. That's what lets line 1650 pick the default for you. |
+| 252 in `apexw/hybrid.py` | Same rule, used by Hybrid Muon mode | Change it there too if you use `use_muon=True`. |
+
+> **Heads up:** in compact mode, if `beta2` is 0.995 or higher, ApexW keeps the variance in 32-bit to stay accurate. That works fine, but it uses more memory than the 2.5 bytes per parameter number at the top of this README.
+
 
 ---
 
