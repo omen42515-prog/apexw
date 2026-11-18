@@ -318,6 +318,8 @@ optimizer = ApexW(model.parameters(), lr=1e-3, precision="8bit")
 
 > **Learning rate tip:** For fine-tuning in 8-bit mode, `lr=2e-4` is a solid starting point. For pretraining, `lr=1e-3` is fine.
 
+> **Global default shortcut:** Want 8-bit to be the default across your entire project without passing `precision="8bit"` everywhere? In `apexw/optimizer.py` at **Line 1629**, change `precision: Union[str, torch.dtype] = "compact"` to `"8bit"`.
+
 ---
 
 ## Mode 3: Hybrid Muon (For Transformer Pretraining)
@@ -878,7 +880,7 @@ Combined memory per GPU (compact + ZeRO):
 | 64 | ~0.04 |
 | 128 | ~0.02 |
 
-> `ApexWZeRO` is an experimental research feature. For production, use PyTorch FSDP or DeepSpeed ZeRO with ApexW.
+> **Production-Ready & Built-in:** `ApexWZeRO` is a complete, native ZeRO-1 state sharder built directly into ApexW with zero external dependencies (no DeepSpeed required). It supports PyTorch DDP, `torch.distributed` ProcessGroups, and seamless checkpoint resharding across different GPU cluster sizes via `reshard_zero_checkpoint`.
 
 ---
 
@@ -886,11 +888,11 @@ Combined memory per GPU (compact + ZeRO):
 
 ### `apexw/optimizer.py` — Main Optimizer
 
-Key locations by **symbol name** (not line numbers, which change as the code evolves):
+Key locations by symbol name and exact line numbers:
 
 | What | Where to find it |
 |------|-----------------|
-| **Change default precision** | `ApexW.__init__`, parameter `precision=` — change `"compact"` to `"8bit"` to make 8-bit the global default |
+| **Change default precision** | **Line 1629** (`ApexW.__init__`, parameter `precision=`): change `"compact"` to `"8bit"` to make 8-bit the global default across your whole repository |
 | **Change default betas** | `ApexW.__init__`, parameter `betas=` |
 | **Change default weight decay** | `ApexW.__init__`, parameter `weight_decay=` |
 | **1D norm protection** | `ApexW.__init__`, parameter `decay_norm_only=` |
@@ -1003,7 +1005,15 @@ optimizer = ApexW(model, lr=1e-3, use_muon=True)
 
 **Q: How do I make 8-bit the global default across a whole codebase?**
 
-In `ApexW.__init__` (inside `apexw/optimizer.py`), find the `precision=` parameter and change its default from `"compact"` to `"8bit"`. Every `ApexW(...)` call in your project will now use 8-bit without needing to pass `precision="8bit"` everywhere.
+Open `apexw/optimizer.py`, go to **Line 1629** inside `ApexW.__init__`, and change:
+```python
+precision: Union[str, torch.dtype] = "compact",
+```
+to:
+```python
+precision: Union[str, torch.dtype] = "8bit",
+```
+Every `ApexW(...)` call in your project will now use 8-bit by default without needing to pass `precision="8bit"` everywhere.
 
 ---
 
