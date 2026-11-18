@@ -764,7 +764,7 @@ optimizer = ApexW(model, lr=1e-3, precision="8bit")
 | `betas` | `(0.9, 0.99)` (compact) / `(0.9, 0.999)` (8bit, full) | **Momentum / variance decay.** Controls how fast the optimizer forgets old history. Rarely needs changing. |
 | `eps` | `1e-8` | **Stability constant.** Prevents division by zero. Never needs changing. |
 | `decay_norm_only` | `True` | **Smart weight decay.** Automatically skips decay for LayerNorm, RMSNorm, and bias layers. Leave on. |
-| `adamw_compat` | `False` | **Exact PyTorch AdamW behavior.** Set `True` for bit-for-bit reproducibility with `torch.optim.AdamW`. |
+| `adamw_compat` | `False` | **Match AdamW's hyperparameter behavior.** Sets `betas=(0.9, 0.999)` (if you didn't pass your own) and applies weight decay to all parameters, including 1D layers. It does **not** change `precision`, so in `compact`/`8bit` the optimizer state is still stored in a smaller form. For math that matches AdamW as closely as possible, also use `precision="full"`. |
 | `clip_grad_norm` | `None` | **Gradient clipping.** e.g. `1.0` — clips inside `optimizer.step()`. |
 | `amsgrad` | `False` | AMSGrad variant. Tracks max variance for more conservative steps. Rarely used. |
 | `nesterov` | `False` | Nesterov momentum variant. |
@@ -819,7 +819,7 @@ ApexW doesn't use exactly the same defaults as `torch.optim.AdamW`. Two things a
 | `betas` | `(0.9, 0.99)` in compact mode, `(0.9, 0.999)` in `8bit` and `full` | `(0.9, 0.999)` | With `beta2=0.99` the optimizer adapts to new gradients in about 100 steps instead of about 1,000. In compact mode (16-bit storage) a `beta2` very close to 1 can make the stored variance get stuck, so a lower value is the safer default. |
 | Weight decay on 1D weights | **Off** (skipped) | On | LayerNorm, RMSNorm and biases usually shouldn't be decayed. LLaMA, nanoGPT and DeepSeek do the same. |
 
-If you need exact PyTorch AdamW behavior:
+If you want AdamW's betas and weight decay behavior:
 
 ```python
 optimizer = ApexW(model.parameters(), lr=1e-3, adamw_compat=True)
@@ -1159,7 +1159,7 @@ Yes. The in-backward hooks are aware of CUDA graph capture and disable themselve
 
 **Q: What does `adamw_compat=True` do?**
 
-Makes ApexW behave exactly like `torch.optim.AdamW`: sets `betas=(0.9, 0.999)` and applies weight decay to all parameters including 1D norms and biases. Use this for bit-for-bit reproducibility with existing AdamW results.
+Makes ApexW use AdamW's hyperparameter behavior: it sets `betas=(0.9, 0.999)` (if you didn't pass your own) and applies weight decay to all parameters, including 1D norms and biases. It does **not** change how the optimizer state is stored. In `compact` and `8bit` mode the state is still compressed, so results will be close to AdamW but not bit-for-bit identical. For the closest match, combine it with `precision="full"`.
 
 ---
 
