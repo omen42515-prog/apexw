@@ -327,7 +327,7 @@ optimizer = ApexW(model.parameters(), lr=1e-3, precision="8bit")
 Add `use_muon=True` and pass the **model itself** (not `model.parameters()`):
 
 ```python
-# Before (compact mode):
+# Before (standard AdamW or compact mode):
 optimizer = ApexW(model.parameters(), lr=1e-3)
 
 # After (Hybrid Muon):
@@ -337,24 +337,55 @@ optimizer = ApexW(model, lr=1e-3, use_muon=True)
 #          NOT model.parameters()
 ```
 
-**Memory:** About 4.0 bytes per parameter — actually *more* than compact mode.
+### What Hybrid Actually Does: Muon + Your Chosen Precision
 
-**Wait, it uses MORE memory? Why use it?**  
-Memory isn't the reason to pick Hybrid Muon. The reason is **faster convergence**. When pretraining a Transformer from scratch, Hybrid Muon often reaches the same loss in fewer steps. You trade a bit more memory for a faster overall training run.
+When you turn on Hybrid mode, ApexW automatically partitions your model into two specialized engines:
+1. **2D Hidden Weight Matrices** (linear layers, attention projections, MLP blocks) $\rightarrow$ updated with **ApexMuon** using Newton-Schulz matrix orthogonalization for cleaner, faster-converging step directions.
+2. **1D Norms, Biases & Embeddings** (LayerNorm, RMSNorm, bias vectors, embedding tables) $\rightarrow$ updated with **ApexW**.
 
-**How it works under the hood:** ApexW automatically splits your model into two groups:
-- **Large 2D weight matrices** (attention, MLP, output heads) → **ApexMuon** (Newton-Schulz orthogonalization)
-- **Everything else** (LayerNorm, biases, embeddings) → **ApexW compact**
+**Crucially, Hybrid respects whichever `precision` you choose:**
+- **Hybrid Compact (Default):**
+  ```python
+  optimizer = ApexW(model, lr=1e-3, use_muon=True)
+  # Or explicitly:
+  optimizer = ApexW(model, lr=1e-3, use_muon=True, precision="compact")
+  ```
+  Muon handles 2D matrices, and ApexW handles 1D/embeddings in compact 16-bit (~4.0 B/param).
+- **Hybrid 8-Bit (Maximum Hybrid Memory Savings):**
+  ```python
+  optimizer = ApexW(model, lr=1e-3, use_muon=True, precision="8bit")
+  ```
+  Muon updates 2D matrices, and all 1D/embedding states are quantized to **8-bit**, slashing memory further!
+- **Hybrid Full:**
+  ```python
+  optimizer = ApexW(model, lr=1e-3, use_muon=True, precision="full")
+  ```
+  Muon for 2D matrices + standard full FP32 states for 1D layers.
 
-You don't have to split anything manually — ApexW figures it out automatically.
+### Where to Set `use_muon=True`
 
-**When to use Hybrid Muon:**
-- Pretraining a Transformer from scratch on a large dataset
-- You want faster convergence and have enough VRAM (~4 B/param)
+You have three easy ways to enable Hybrid Muon:
+1. **In your training script:**
+   Pass `use_muon=True` to `ApexW(model, ..., use_muon=True)`, or import `HybridApexW` directly:
+   ```python
+   from apexw import HybridApexW
+   optimizer = HybridApexW(model, lr=1e-3)
+   ```
+2. **As a global default across your repository:**
+   Open `apexw/optimizer.py` at **Line 1639** inside `ApexW.__init__`, and change:
+   ```python
+   use_muon: bool = False,
+   ```
+   to:
+   ```python
+   use_muon: bool = True,
+   ```
+   Now every `ApexW(model, ...)` call will automatically run in Hybrid Muon mode by default!
+3. **In Hugging Face Trainer:**
+   Set `optim="hybrid_apexw"` in `TrainingArguments`.
 
-**When NOT to use Hybrid Muon:**
-- Fine-tuning a pre-existing model → use compact or 8-bit instead
-- Very limited VRAM → use 8-bit instead
+**Why use Hybrid Muon?**  
+Memory isn't the primary reason — **faster convergence** is. When pretraining a Transformer from scratch, Muon's orthogonalized update steps often reach your target loss in significantly fewer steps than standard AdamW.
 
 > **Note:** You may see `precision="ultra"` in the codebase. This is an old prototype (3.0 B/param) that has been fully superseded by `8bit` (0.754 B/param). Don't use it.
 
@@ -897,7 +928,7 @@ Key locations by symbol name and exact line numbers:
 | **Change default weight decay** | `ApexW.__init__`, parameter `weight_decay=` |
 | **1D norm protection** | `ApexW.__init__`, parameter `decay_norm_only=` |
 | **Change Quad-V threshold** | `ApexW.__init__`, parameter `threshold=` |
-| **Enable Muon by default** | `ApexW.__init__`, parameter `use_muon=` — change to `True` |
+| **Enable Muon by default** | **Line 1639** (`ApexW.__init__`, parameter `use_muon=`): change `False` to `True` to make Hybrid mode the global default |
 | **8-bit runtime acceleration** | `ApexW._enable_8bit_runtime_acceleration()` |
 | **In-backward fused stepping** | `ApexW.enable_fused_backward()` |
 | **Memory summary** | `ApexW.print_summary()` |
@@ -915,7 +946,7 @@ Key parameters in `HybridApexW.__init__`:
 | `lr` | `1e-3` | Base LR for 1D/norm/embedding layers |
 | `muon_lr` | `None` → inherits `lr` | Separate LR for 2D Muon layers |
 | `scale_mode` | `"rms_matched"` | `0.2 * sqrt(max(m,n))` to match AdamW RMS at drop-in LR |
-| `precision` | `"compact"` | Precision for 1D/norm layers — set to `"8bit"` for max savings |
+| `precision` | `"compact"` | **Line 233**: Precision for 1D/norm layers — set to `"8bit"` for max savings |
 | `min_muon_dim` | `32` | Min matrix dimension to route to Muon |
 | `exclude_embeddings` | `True` | Heuristic to skip embedding tables from Muon routing |
 
@@ -994,12 +1025,31 @@ optimizer = ApexW(model.parameters(), lr=1e-3, precision="8bit")
 
 ---
 
-**Q: How do I use Hybrid Muon?**
+**Q: How do I use Hybrid Muon, and can I combine it with 8-bit?**
 
-Add `use_muon=True` and pass the model (not `model.parameters()`):
+Yes! Hybrid mode routes 2D weight matrices to **ApexMuon(its muon)** and 1D norms/biases/embeddings to **ApexW**, and it respects whichever precision mode you choose:
 ```python
+# Hybrid with compact 16-bit states (default, ~4.0 B/param):
 optimizer = ApexW(model, lr=1e-3, use_muon=True)
+
+# Hybrid with 8-bit quantized states (maximum hybrid memory savings):
+optimizer = ApexW(model, lr=1e-3, use_muon=True, precision="8bit")
 ```
+*Note:* Always pass `model` directly (not `model.parameters()`) so ApexW can inspect layer names and shapes for automatic routing.
+
+---
+
+**Q: Where can I enable Hybrid Muon as the global default across my codebase?**
+
+Open `apexw/optimizer.py`, go to **Line 1639** inside `ApexW.__init__`, and change:
+```python
+use_muon: bool = False,
+```
+to:
+```python
+use_muon: bool = True,
+```
+Now every `ApexW(model, ...)` in your project will run in Hybrid Muon mode automatically.
 
 ---
 
