@@ -362,6 +362,12 @@ When you turn on Hybrid mode, ApexW automatically partitions your model into two
   ```
   Muon for 2D matrices + standard full FP32 states for 1D layers.
 
+> **Why is `compact` the default in Hybrid mode?**  
+> In Transformers, **over 98% of parameters are 2D weight matrices** (handled by Muon). Only ~1% are 1D layers (LayerNorm, RMSNorm scales, biases).  
+> - Quantizing 1D norms to 8-bit saves almost no memory (a few megabytes), but LayerNorm/RMSNorm scales are sensitive to precision during training.  
+> - Therefore, **Hybrid ApexW intentionally defaults to `compact` (16-bit) for 1D layers and embeddings** to ensure rock-solid numerical stability.  
+> - It will **only** switch 1D layers and embeddings to 8-bit if you explicitly pass `precision="8bit"` (useful if your model has a massive 128k-token embedding table).
+
 ### Where to Set `use_muon=True`
 
 You have three easy ways to enable Hybrid Muon:
@@ -1027,7 +1033,7 @@ optimizer = ApexW(model.parameters(), lr=1e-3, precision="8bit")
 
 **Q: How do I use Hybrid Muon, and can I combine it with 8-bit?**
 
-Yes! Hybrid mode routes 2D weight matrices to **ApexMuon(its muon)** and 1D norms/biases/embeddings to **ApexW**, and it respects whichever precision mode you choose:
+Yes! Hybrid mode routes 2D weight matrices to **ApexMuon** and 1D norms/biases/embeddings to **ApexW**, and it respects whichever precision mode you choose:
 ```python
 # Hybrid with compact 16-bit states (default, ~4.0 B/param):
 optimizer = ApexW(model, lr=1e-3, use_muon=True)
@@ -1036,6 +1042,15 @@ optimizer = ApexW(model, lr=1e-3, use_muon=True)
 optimizer = ApexW(model, lr=1e-3, use_muon=True, precision="8bit")
 ```
 *Note:* Always pass `model` directly (not `model.parameters()`) so ApexW can inspect layer names and shapes for automatic routing.
+
+---
+
+**Q: When does Hybrid ApexW use compact vs. 8-bit? Can I keep 1D layers in compact?**
+
+**Compact is already the default for Hybrid mode!**  
+When you call `ApexW(model, lr=1e-3, use_muon=True)`, ApexW routes 2D weight matrices to Muon, and automatically keeps the 1D normalization layers (LayerNorm, RMSNorm) and embeddings in **compact (16-bit) ApexW**.
+
+Even if you changed `apexw/optimizer.py` Line 1629 to default to `"8bit"` for regular training, `HybridApexW` independently defaults to `precision="compact"` (defined in `apexw/hybrid.py` at Line 233). 1D layers will **only** use 8-bit if you explicitly pass `precision="8bit"`.
 
 ---
 
