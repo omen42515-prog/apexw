@@ -35,9 +35,11 @@ Your training loop, your model, your data — **nothing else changes**. You just
 
 | Mode | One-liner | Memory | Best for |
 |------|-----------|--------|---------|
-| **Compact** (default) | `ApexW(model.parameters(), lr=1e-3)` | 2.5 B/param | General use, any hardware |
+| **Compact** (default) | `ApexW(model.parameters(), lr=1e-3)` | 2.50 B/param | General use, any hardware |
 | **8-bit** | `ApexW(model.parameters(), lr=1e-3, precision="8bit")` | 0.754 B/param | Consumer GPUs, LoRA, large models |
-| **Hybrid Muon** | `ApexW(model, lr=1e-3, use_muon=True)` | ~4.0 B/param | Transformer pretraining from scratch |
+| **Hybrid Muon** | `ApexW(model, lr=1e-3, use_muon=True)` | ~2.50 B/param | Transformer pretraining from scratch |
+
+> **Distributed ZeRO-1 Feature:** Scaling across multiple GPUs? Wrap with `ApexWZeRO` (`from apexw import ApexWZeRO`) for native ZeRO-1 state sharding (down to ~0.04 B/param on 64 GPUs) without needing DeepSpeed.
 
 Details for each mode are in [Part 2](#part-2-how-to-use-apexw).
 
@@ -295,9 +297,11 @@ Use Compact mode (the default — no extra code needed)
 
 | Mode | One-liner | Memory | Best for |
 |------|-----------|--------|---------|
-| **Compact** (default) | `ApexW(model.parameters(), lr=1e-3)` | 2.5 B/param | General use, any hardware |
+| **Compact** (default) | `ApexW(model.parameters(), lr=1e-3)` | 2.50 B/param | General use, any hardware |
 | **8-bit** | `ApexW(model.parameters(), lr=1e-3, precision="8bit")` | 0.754 B/param | Consumer GPUs, LoRA, large models |
-| **Hybrid Muon** | `ApexW(model, lr=1e-3, use_muon=True)` | ~4.0 B/param | Transformer pretraining from scratch |
+| **Hybrid Muon** | `ApexW(model, lr=1e-3, use_muon=True)` | ~2.50 B/param | Transformer pretraining from scratch |
+
+> **Distributed Feature:** Multi-GPU runs can use `ApexWZeRO(model.parameters(), ...)` to shard optimizer states down to 0.04–0.31 B/param across 8–64 GPUs.
 
 ---
 
@@ -345,7 +349,7 @@ optimizer = ApexW(model.parameters(), lr=1e-3, precision="8bit")
 
 > **Learning rate tip:** For fine-tuning in 8-bit mode, `lr=2e-4` is a solid starting point. For pretraining, `lr=1e-3` is fine.
 
-> **Global default shortcut:** Want 8-bit to be the default across your entire project without passing `precision="8bit"` everywhere? In `apexw/optimizer.py` at **Line 1629**, change `precision: Union[str, torch.dtype] = "compact"` to `"8bit"`.
+> **Global default shortcut:** Want 8-bit to be the default across your entire project without passing `precision="8bit"` everywhere? In `apexw/optimizer.py` at **Line 1650**, change `precision: Union[str, torch.dtype] = "compact"` to `"8bit"`.
 
 ---
 
@@ -405,7 +409,7 @@ You have three easy ways to enable Hybrid Muon:
    optimizer = HybridApexW(model, lr=1e-3)
    ```
 2. **As a global default across your repository:**
-   Open `apexw/optimizer.py` at **Line 1639** inside `ApexW.__init__`, and change:
+   Open `apexw/optimizer.py` at **Line 1660** inside `ApexW.__init__`, and change:
    ```python
    use_muon: bool = False,
    ```
@@ -753,6 +757,35 @@ optimizer = ApexW(model, lr=1e-3, precision="8bit")
 
 ---
 
+### 12. Parameter Flattening (`flatten_parameters`)
+
+For models with thousands of small weights or biases (e.g. mixture-of-experts gating networks or deep architectures with many small layers), launching a separate CUDA kernel for every tensor creates dispatch bottlenecks. `flatten_parameters` transparently packs model parameters into a single contiguous 1D buffer while redirecting layer references to zero-copy slice views:
+
+```python
+from apexw import ApexW, flatten_parameters
+
+# Pack all parameters with numel <= 50,000 into a unified contiguous buffer
+flat_param = flatten_parameters(model, max_numel=50000)
+
+optimizer = ApexW(model.parameters(), lr=1e-3)
+```
+
+---
+
+### 13. Memory Breakdown Diagnostics (`get_memory_breakdown`)
+
+Track exactly where your VRAM is going across model weights, optimizer states, activations, and peak allocator overhead:
+
+```python
+from apexw import ApexW, get_memory_breakdown
+
+optimizer = ApexW(model.parameters(), lr=1e-3)
+breakdown = get_memory_breakdown(model, optimizer)
+print(breakdown)
+```
+
+---
+
 ## All Settings Explained
 
 | Setting | Default | What it does |
@@ -838,9 +871,9 @@ optimizer = ApexW(model.parameters(), lr=6e-4, betas=(0.9, 0.95))
 
 | Line | What's there | What to do |
 |------|--------------|-----------|
-| **1650** | `betas = (0.9, 0.999) if precision in ("8bit", "full") else (0.9, 0.99)` | Change the two tuples. The first is used for `8bit` and `full`, the second for `compact`. |
-| 1615 | `betas: ... = None` in `ApexW.__init__` | Leave it as `None`. That's what lets line 1650 pick the default for you. |
-| 252 in `apexw/hybrid.py` | Same rule, used by Hybrid Muon mode | Change it there too if you use `use_muon=True`. |
+| **1673** | `betas = (0.9, 0.999) if precision in ("8bit", "full") else (0.9, 0.99)` | Change the two tuples. The first is used for `8bit` and `full`, the second for `compact`. |
+| 1636 | `betas: ... = None` in `ApexW.__init__` | Leave it as `None`. That's what lets line 1673 pick the default for you. |
+| 263 in `apexw/hybrid.py` | Same rule, used by Hybrid Muon mode | Change it there too if you use `use_muon=True`. |
 
 > **Heads up:** in compact mode, if `beta2` is 0.995 or higher, ApexW keeps the variance in 32-bit to stay accurate. That works fine, but it uses more memory than the 2.5 bytes per parameter number at the top of this README.
 
@@ -975,12 +1008,12 @@ Key locations by symbol name and exact line numbers:
 
 | What | Where to find it |
 |------|-----------------|
-| **Change default precision** | **Line 1629** (`ApexW.__init__`, parameter `precision=`): change `"compact"` to `"8bit"` to make 8-bit the global default across your whole repository |
+| **Change default precision** | **Line 1650** (`ApexW.__init__`, parameter `precision=`): change `"compact"` to `"8bit"` to make 8-bit the global default across your whole repository |
 | **Change default betas** | `ApexW.__init__`, parameter `betas=` |
 | **Change default weight decay** | `ApexW.__init__`, parameter `weight_decay=` |
 | **1D norm protection** | `ApexW.__init__`, parameter `decay_norm_only=` |
 | **Change Quad-V threshold** | `ApexW.__init__`, parameter `threshold=` |
-| **Enable Muon by default** | **Line 1639** (`ApexW.__init__`, parameter `use_muon=`): change `False` to `True` to make Hybrid mode the global default |
+| **Enable Muon by default** | **Line 1660** (`ApexW.__init__`, parameter `use_muon=`): change `False` to `True` to make Hybrid mode the global default |
 | **8-bit runtime acceleration** | `ApexW._enable_8bit_runtime_acceleration()` |
 | **In-backward fused stepping** | `ApexW.enable_fused_backward()` |
 | **Memory summary** | `ApexW.print_summary()` |
@@ -998,7 +1031,7 @@ Key parameters in `HybridApexW.__init__`:
 | `lr` | `1e-3` | Base LR for 1D/norm/embedding layers |
 | `muon_lr` | `None` → inherits `lr` | Separate LR for 2D Muon layers |
 | `scale_mode` | `"rms_matched"` | `0.2 * sqrt(max(m,n))` to match AdamW RMS at drop-in LR |
-| `precision` | `"compact"` | **Line 233**: Precision for 1D/norm layers — set to `"8bit"` for max savings |
+| `precision` | `"compact"` | **Line 240**: Precision for 1D/norm layers — set to `"8bit"` for max savings |
 | `min_muon_dim` | `32` | Min matrix dimension to route to Muon |
 | `exclude_embeddings` | `True` | Heuristic to skip embedding tables from Muon routing |
 
@@ -1046,6 +1079,20 @@ Key parameters in `HybridApexW.__init__`:
 | `register_hf_trainer_optimizer` | Patches HF Trainer to recognize `"apexw"`, `"apexw_8bit"`, `"hybrid_apexw"` strings |
 | `get_apexw_optimizer` | Constructs the right optimizer from a model and training args |
 | `ApexWTrainer` | Trainer subclass with Hybrid Muon built in |
+
+### `apexw/flatten.py` — Parameter Flattening
+
+| Component | What it does |
+|-----------|-------------|
+| `flatten_parameters` | Packs thousands of small weights into a contiguous 1D buffer, eliminating launch overhead |
+| `is_flattened` | Checks if a model's parameters have been flattened |
+
+### `apexw/fsdp.py` — Distributed FSDP & Muon
+
+| Component | What it does |
+|-----------|-------------|
+| `DistMuon` | Distributed Muon across multi-GPU ranks without DDP overhead |
+| `is_fsdp_flat_param` | Detects PyTorch FSDP-sharded flat parameters |
 
 </details>
 
@@ -1096,13 +1143,13 @@ optimizer = ApexW(model, lr=1e-3, use_muon=True, precision="8bit")
 **Compact is already the default for Hybrid mode!**  
 When you call `ApexW(model, lr=1e-3, use_muon=True)`, ApexW routes 2D weight matrices to Muon, and automatically keeps the 1D normalization layers (LayerNorm, RMSNorm) and embeddings in **compact (16-bit) ApexW**.
 
-Even if you changed `apexw/optimizer.py` Line 1629 to default to `"8bit"` for regular training, `HybridApexW` independently defaults to `precision="compact"` (defined in `apexw/hybrid.py` at Line 233). 1D layers will **only** use 8-bit if you explicitly pass `precision="8bit"`.
+Even if you changed `apexw/optimizer.py` Line 1650 to default to `"8bit"` for regular training, `HybridApexW` independently defaults to `precision="compact"` (defined in `apexw/hybrid.py` at Line 240). 1D layers will **only** use 8-bit if you explicitly pass `precision="8bit"`.
 
 ---
 
 **Q: Where can I enable Hybrid Muon as the global default across my codebase?**
 
-Open `apexw/optimizer.py`, go to **Line 1639** inside `ApexW.__init__`, and change:
+Open `apexw/optimizer.py`, go to **Line 1660** inside `ApexW.__init__`, and change:
 ```python
 use_muon: bool = False,
 ```
@@ -1116,7 +1163,7 @@ Now every `ApexW(model, ...)` in your project will run in Hybrid Muon mode autom
 
 **Q: How do I make 8-bit the global default across a whole codebase?**
 
-Open `apexw/optimizer.py`, go to **Line 1629** inside `ApexW.__init__`, and change:
+Open `apexw/optimizer.py`, go to **Line 1650** inside `ApexW.__init__`, and change:
 ```python
 precision: Union[str, torch.dtype] = "compact",
 ```
